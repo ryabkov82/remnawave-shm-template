@@ -90,8 +90,6 @@ sanitize_username: true
    vpn_rmw
    ```
 3. Скопируйте содержимое файла `shm-remnawave.template.sh`  
-   или версии с санитизацией:  
-   `shm-remnawave.template.sanitized.sh`
 4. Сохраните.
 
 ---
