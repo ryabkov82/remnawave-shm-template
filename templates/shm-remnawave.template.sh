@@ -1,7 +1,10 @@
 #!/bin/bash
 #
 # Remnawave ↔ SHM template (v1.3, resolve internal squad by NAME only, no cache)
-# Значения берутся из server.settings.remnawave.* — UUID внутреннего сквада НЕ используется.
+# Internal Squad определяется по имени:
+# 1) us.service.settings.remnawave.internal_squad_name
+# 2) fallback: server.settings.remnawave.default_internal_squad_name
+# UUID внутреннего сквада в SHM не хранится и всегда резолвится через API панели.
 #
 set -euo pipefail
 
@@ -14,6 +17,8 @@ API_URL="{{ config.api.url }}"
 PANEL_URL="{{ server.settings.remnawave.api }}"
 REMNAWAVE_API_TOKEN="{{ server.settings.remnawave.token }}"
 DEFAULT_INTERNAL_SQUAD_NAME="{{ server.settings.remnawave.default_internal_squad_name }}"
+# ---- us.service.settings.remnawave.* ----
+SERVICE_INTERNAL_SQUAD_NAME="{{ us.service.settings.remnawave.internal_squad_name }}"
 
 # New: tz & safety minutes pulled from server settings (with sane defaults)
 # If SHM's {{ us.expire }} is in Moscow time, set shm_tz: Europe/Moscow
@@ -23,11 +28,6 @@ REMNAWAVE_EXPIRE_SAFETY_MINUTES="{{ server.settings.remnawave.expire_safety_minu
 USERNAME="us_{{ us.id }}"
 SANITIZE_USERNAME="{{ server.settings.remnawave.sanitize_username }}"
 SANITIZE_USERNAME="${SANITIZE_USERNAME:-false}"
-if [[ "${SANITIZE_USERNAME}" == "true" ]]; then
-  USERNAME_SANITIZED="$(_sanitize_username "${USERNAME}")"
-else
-  USERNAME_SANITIZED="${USERNAME}"
-fi
 STATUS_ACTIVE="ACTIVE"
 STATUS_DISABLED="DISABLED"
 
@@ -64,13 +64,21 @@ _sanitize_username() {
   echo "$out"
 }
 
+if [[ "${SANITIZE_USERNAME}" == "true" ]]; then
+  USERNAME_SANITIZED="$(_sanitize_username "${USERNAME}")"
+else
+  USERNAME_SANITIZED="${USERNAME}"
+fi
+
 # Expire: interpret {{ us.expire }} as LOCAL time in SHM TZ (or system TZ), then output UTC (Z)
 _expire_iso() {
   local base="{{ us.expire }}"
   local mins="${REMNAWAVE_EXPIRE_SAFETY_MINUTES:-0}"
 
+  [[ -n "${mins}" && "${mins}" != "null" ]] || mins=0
+
   local base_epoch
-  if [[ -n "${REMNAWAVE_SHM_TZ}" ]]; then
+  if [[ -n "${REMNAWAVE_SHM_TZ:-}" && "${REMNAWAVE_SHM_TZ}" != "null" ]]; then
     base_epoch="$(TZ="${REMNAWAVE_SHM_TZ}" date -d "${base}" +%s)" || fail "cannot parse us.expire in ${REMNAWAVE_SHM_TZ}"
   else
     base_epoch="$(date -d "${base}" +%s)" || fail "cannot parse us.expire (system TZ)"
@@ -95,12 +103,27 @@ _normalize_subscription_json() {
   jq '.response |= (if has("subscriptionUrl") then . + {subscription_url: .subscriptionUrl} else . end)'
 }
 
+_effective_internal_squad_name() {
+  if [[ -n "${SERVICE_INTERNAL_SQUAD_NAME:-}" && "${SERVICE_INTERNAL_SQUAD_NAME}" != "null" ]]; then
+    echo "${SERVICE_INTERNAL_SQUAD_NAME}"
+  elif [[ -n "${DEFAULT_INTERNAL_SQUAD_NAME:-}" && "${DEFAULT_INTERNAL_SQUAD_NAME}" != "null" ]]; then
+    echo "${DEFAULT_INTERNAL_SQUAD_NAME}"
+  else
+    fail "No internal squad configured: neither us.service.settings.remnawave.internal_squad_name nor server.settings.remnawave.default_internal_squad_name is set"
+  fi
+}
+
 # Всегда резолвим UUID внутреннего сквада по ИМЕНИ (без кеша)
 _resolve_internal_squad_uuid_by_name() {
-  [[ -n "${DEFAULT_INTERNAL_SQUAD_NAME:-}" ]] || fail "server.settings.remnawave.default_internal_squad_name is empty"
+  local squad_name="$1"
+  [[ -n "${squad_name:-}" ]] || fail "internal squad name is empty"
+
   local uuid
-  uuid="$(_http_get "/api/internal-squads" | jq -r --arg NAME "${DEFAULT_INTERNAL_SQUAD_NAME}" '.response.internalSquads[] | select(.name==$NAME) | .uuid' | head -n1)"
-  [[ -n "${uuid}" ]] || fail "Internal Squad '${DEFAULT_INTERNAL_SQUAD_NAME}' not found on panel ${PANEL_URL}"
+  uuid="$(_http_get "/api/internal-squads" \
+    | jq -r --arg NAME "${squad_name}" '.response.internalSquads[] | select(.name==$NAME) | .uuid' \
+    | head -n1)"
+
+  [[ -n "${uuid}" ]] || fail "Internal Squad '${squad_name}' not found on panel ${PANEL_URL}"
   echo "${uuid}"
 }
 
@@ -114,7 +137,8 @@ _enable_user()              { local uuid="$1"; _http_post "/api/users/${uuid}/ac
 # Payloads
 _build_create_payload() {
   local expire_iso="$(_expire_iso)"
-  local squad_uuid="$(_resolve_internal_squad_uuid_by_name)"
+  local squad_name="$(_effective_internal_squad_name)"
+  local squad_uuid="$(_resolve_internal_squad_uuid_by_name "${squad_name}")"  
   cat <<JSON
 {
   "username": "${USERNAME}",
@@ -158,6 +182,7 @@ case "${EVENT}" in
 
   CREATE)
     log "Create user ${USERNAME}"
+    log "Effective internal squad: $(_effective_internal_squad_name)"
     payload="$(_build_create_payload)"
     resp="$(_http_post '/api/users' --data "${payload}")"
     uuid="$(echo "${resp}" | jq -r '.response.user.uuid // .response.uuid // empty')"

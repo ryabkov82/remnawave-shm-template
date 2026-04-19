@@ -11,6 +11,7 @@
 - Автоматическое управление пользователями Remnawave:
   - создание, активация, блокировка, продление, удаление;
 - Привязка к **Internal Squad** (через имя, без кэша UUID);
+- **🆕 Поддержка выбора Internal Squad на уровне услуги SHM (с fallback на серверный Squad)**;
 - Корректная обработка срока действия `{{ us.expire }}` с учётом таймзоны SHM и перехода на летнее/зимнее время;
 - Загрузка JSON-профиля пользователя в SHM (`storage/manage/vpn_rmw_<id>`);
 - Минимальные зависимости (`curl`, `jq`);
@@ -27,7 +28,7 @@
 remnawave:
   api: https://panel.example.com           # Базовый URL панели Remnawave (https://...)
   token: eyJh...                           # API-токен (Bearer)
-  default_internal_squad_name: Default-Squad  # Internal Squad, куда добавляются новые пользователи
+  default_internal_squad_name: Default-Squad  # Fallback Internal Squad (если не задан в услуге)
 
   # Необязательные параметры:
   shm_tz: Europe/Moscow          # Таймзона SHM, если отличается от системной
@@ -39,16 +40,36 @@ remnawave:
 
 | Параметр | Обязательный | Описание |
 |-----------|--------------|-----------|
-| `api` | ✅ | Базовый URL API панели (например `https://panel.example.com`) |
+| `api` | ✅ | Базовый URL API панели (например https://panel.example.com) |
 | `token` | ✅ | Bearer-токен администратора Remnawave |
-| `default_internal_squad_name` | ✅ | Имя Internal Squad для новых пользователей |
-| `shm_tz` | ⛔ | Таймзона SHM для корректной конвертации времени (пример: `Europe/Moscow`) |
+| `default_internal_squad_name` | ✅ | Internal Squad по умолчанию (если не задан в услуге) |
+| `shm_tz` | ⛔ | Таймзона SHM для корректной конвертации времени (пример: Europe/Moscow) |
 | `expire_safety_minutes` | ⛔ | Дополнительный сдвиг срока действия в минутах |
-| `sanitize_username` | ⛔ | Если `true`,username приводится алгоритмом из remnawave/subscription-page |
+| `sanitize_username` | ⛔ | Если true,username приводится алгоритмом из remnawave/subscription-page |
 
 ---
 
-## 🧹 Опция `sanitize_username`
+## 🧩 Настройки услуги (опционально)
+
+Для конкретной услуги в SHM можно задать собственный Internal Squad:
+
+```yaml
+remnawave:
+  internal_squad_name: AntiBlock-Squad
+```
+
+### Приоритет выбора Internal Squad
+
+Шаблон определяет Internal Squad в следующем порядке:
+
+1. `us.service.settings.remnawave.internal_squad_name`
+2. `server.settings.remnawave.default_internal_squad_name`
+
+Это позволяет использовать один и тот же шаблон для нескольких тарифов и направлять пользователей в разные Internal Squad Remnawave.
+
+---
+
+## 🧹 Опция sanitize_username
 
 Когда параметр:
 
@@ -56,7 +77,7 @@ remnawave:
 sanitize_username: true
 ```
 
-включён — все вызовы API Remnawave (кроме `CREATE`) используют **санитизированное имя пользователя**:
+включён — все вызовы API Remnawave (кроме CREATE) используют **санитизированное имя пользователя**:
 
 - допускаются только `[A-Za-z0-9_-]`;
 - остальные символы заменяются на `_`;
@@ -64,32 +85,30 @@ sanitize_username: true
 - алгоритм полностью совпадает с реализацией в:  
   https://github.com/remnawave/subscription-page/blob/main/backend/src/common/utils/sanitize-username.ts
 
-Это необходимо для корректной работы **legacy-ссылок Marzban**, где username проходил аналогичную нормализацию.
-
 ### 👉 Важно:
-- `CREATE` всегда использует оригинальный username (`us_<id>`);
-- Все остальные события (`ACTIVATE`, `BLOCK`, `REMOVE`, `UPDATE`, `PROLONGATE`) используют санитизированную версию.
+- CREATE всегда использует оригинальный username (us_<id>);
+- Все остальные события используют санитизированную версию.
 
 ---
 
 ## 🕒 Обработка времени
 
 Функция `_expire_iso()` автоматически:
-- читает `{{ us.expire }}` из SHM (локальное время сервера или заданная `shm_tz`);
+- читает `{{ us.expire }}` из SHM;
 - учитывает переходы DST;
-- переводит в формат ISO-8601 UTC (`YYYY-MM-DDTHH:MM:SSZ`);
-- при необходимости добавляет `expire_safety_minutes`.
+- переводит в ISO-8601 UTC;
+- применяет `expire_safety_minutes`.
 
 ---
 
 ## 📜 Установка
 
 1. В панели SHM откройте **Templates → Add new**.
-2. Назовите шаблон, например:  
+2. Назовите шаблон, например:
    ```
    vpn_rmw
    ```
-3. Скопируйте содержимое файла `shm-remnawave.template.sh`  
+3. Скопируйте содержимое файла `shm-remnawave.template.sh`
 4. Сохраните.
 
 ---
