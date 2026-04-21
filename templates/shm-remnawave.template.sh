@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Remnawave ↔ SHM template (v1.3, resolve internal squad by NAME only, no cache)
+# Remnawave ↔ SHM template (v1.4)
 # Internal Squad определяется по имени:
 # 1) us.service.settings.remnawave.internal_squad_name
 # 2) fallback: server.settings.remnawave.default_internal_squad_name
@@ -17,11 +17,14 @@ API_URL="{{ config.api.url }}"
 PANEL_URL="{{ server.settings.remnawave.api }}"
 REMNAWAVE_API_TOKEN="{{ server.settings.remnawave.token }}"
 DEFAULT_INTERNAL_SQUAD_NAME="{{ server.settings.remnawave.default_internal_squad_name }}"
+
 # ---- us.service.settings.remnawave.* ----
 SERVICE_INTERNAL_SQUAD_NAME="{{ us.service.settings.remnawave.internal_squad_name }}"
+SERVICE_TRAFFIC_LIMIT_BYTES="{{ us.service.settings.remnawave.traffic_limit_bytes }}"
+SERVICE_TRAFFIC_LIMIT_STRATEGY="{{ us.service.settings.remnawave.traffic_limit_strategy }}"
+SERVICE_HWID_DEVICE_LIMIT="{{ us.service.settings.remnawave.hwid_device_limit }}"
 
-# New: tz & safety minutes pulled from server settings (with sane defaults)
-# If SHM's {{ us.expire }} is in Moscow time, set shm_tz: Europe/Moscow
+# ---- server.settings.remnawave optional ----
 REMNAWAVE_SHM_TZ="{{ server.settings.remnawave.shm_tz }}"
 REMNAWAVE_EXPIRE_SAFETY_MINUTES="{{ server.settings.remnawave.expire_safety_minutes }}"
 
@@ -99,7 +102,6 @@ _subscription_json_by_username() {
 }
 
 _normalize_subscription_json() {
-  # Adds legacy alias .response.subscription_url = .response.subscriptionUrl (if exists)
   jq '.response |= (if has("subscriptionUrl") then . + {subscription_url: .subscriptionUrl} else . end)'
 }
 
@@ -111,6 +113,43 @@ _effective_internal_squad_name() {
   else
     fail "No internal squad configured: neither us.service.settings.remnawave.internal_squad_name nor server.settings.remnawave.default_internal_squad_name is set"
   fi
+}
+
+_effective_traffic_limit_bytes() {
+  local v="${SERVICE_TRAFFIC_LIMIT_BYTES:-}"
+  [[ -n "${v}" && "${v}" != "null" ]] || { echo "0"; return; }
+
+  [[ "${v}" =~ ^[0-9]+$ ]] || fail "Invalid traffic_limit_bytes: '${v}' (must be non-negative integer)"
+  echo "${v}"
+}
+
+_effective_traffic_limit_strategy() {
+  local v="${SERVICE_TRAFFIC_LIMIT_STRATEGY:-}"
+  [[ -n "${v}" && "${v}" != "null" ]] || { echo "NO_RESET"; return; }
+
+  v="$(echo "${v}" | tr '[:lower:]' '[:upper:]')"
+  case "${v}" in
+    NO_RESET|DAY|WEEK|MONTH)
+      echo "${v}"
+      ;;
+    *)
+      fail "Invalid traffic_limit_strategy: '${v}' (allowed: NO_RESET, DAY, WEEK, MONTH)"
+      ;;
+  esac
+}
+
+_effective_hwid_device_limit() {
+  local v="${SERVICE_HWID_DEVICE_LIMIT:-}"
+  [[ -n "${v}" && "${v}" != "null" ]] || { echo "0"; return; }
+
+  [[ "${v}" =~ ^[0-9]+$ ]] || fail "Invalid hwid_device_limit: '${v}' (must be non-negative integer)"
+  echo "${v}"
+}
+
+_log_effective_limits() {
+  log "Effective traffic limit bytes: $(_effective_traffic_limit_bytes)"
+  log "Effective traffic reset strategy: $(_effective_traffic_limit_strategy)"
+  log "Effective HWID device limit: $(_effective_hwid_device_limit)"
 }
 
 # Всегда резолвим UUID внутреннего сквада по ИМЕНИ (без кеша)
@@ -138,19 +177,23 @@ _enable_user()              { local uuid="$1"; _http_post "/api/users/${uuid}/ac
 _build_create_payload() {
   local expire_iso="$(_expire_iso)"
   local squad_name="$(_effective_internal_squad_name)"
-  local squad_uuid="$(_resolve_internal_squad_uuid_by_name "${squad_name}")"  
+  local squad_uuid="$(_resolve_internal_squad_uuid_by_name "${squad_name}")"
+  local traffic_limit_bytes="$(_effective_traffic_limit_bytes)"
+  local traffic_limit_strategy="$(_effective_traffic_limit_strategy)"
+  local hwid_device_limit="$(_effective_hwid_device_limit)"
+
   cat <<JSON
 {
   "username": "${USERNAME}",
   "status": "${STATUS_ACTIVE}",
-  "trafficLimitBytes": 0,
-  "trafficLimitStrategy": "NO_RESET",
+  "trafficLimitBytes": ${traffic_limit_bytes},
+  "trafficLimitStrategy": "${traffic_limit_strategy}",
   "expireAt": "${expire_iso}",
   "description": "SHM: login={{ user.login }}, name={{ user.full_name }}, url=https://t.me/{{ user.settings.telegram.login }}",
   "tag": null,
   "telegramId": null,
   "email": null,
-  "hwidDeviceLimit": 0,
+  "hwidDeviceLimit": ${hwid_device_limit},
   "activeInternalSquads": ["${squad_uuid}"],
   "externalSquadUuid": null
 }
@@ -160,16 +203,23 @@ JSON
 _build_update_payload() {
   local uuid="$1"
   local expire_iso="$(_expire_iso)"
+  local traffic_limit_bytes="$(_effective_traffic_limit_bytes)"
+  local traffic_limit_strategy="$(_effective_traffic_limit_strategy)"
+  local hwid_device_limit="$(_effective_hwid_device_limit)"
+
   cat <<JSON
 {
   "uuid": "${uuid}",
   "status": "${STATUS_ACTIVE}",
-  "expireAt": "${expire_iso}"
+  "trafficLimitBytes": ${traffic_limit_bytes},
+  "trafficLimitStrategy": "${traffic_limit_strategy}",
+  "expireAt": "${expire_iso}",
+  "hwidDeviceLimit": ${hwid_device_limit}
 }
 JSON
 }
 
-log "Remnawave Template v1.3 (resolve by name only)"
+log "Remnawave Template v1.4"
 log "EVENT=${EVENT}"
 
 case "${EVENT}" in
@@ -183,6 +233,7 @@ case "${EVENT}" in
   CREATE)
     log "Create user ${USERNAME}"
     log "Effective internal squad: $(_effective_internal_squad_name)"
+    _log_effective_limits
     payload="$(_build_create_payload)"
     resp="$(_http_post '/api/users' --data "${payload}")"
     uuid="$(echo "${resp}" | jq -r '.response.user.uuid // .response.uuid // empty')"
@@ -210,6 +261,7 @@ case "${EVENT}" in
     [[ -n "${uuid}" ]] || fail "User not found: ${USERNAME}"
 
     _enable_user "${uuid}"
+    _log_effective_limits
     payload="$(_build_update_payload "${uuid}")"
     _http_patch "/api/users" --data "${payload}" >/dev/null
     log "done"
@@ -242,6 +294,7 @@ case "${EVENT}" in
     [[ -n "${uuid}" ]] || fail "User not found: ${USERNAME}"
 
     _reset_user_traffic "${uuid}"
+    _log_effective_limits
     payload="$(_build_update_payload "${uuid}")"
     _http_patch "/api/users" --data "${payload}" >/dev/null
     log "done"
