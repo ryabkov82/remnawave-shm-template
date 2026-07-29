@@ -108,6 +108,78 @@ remnawave:
 - Существующие пользователи требуют отдельной reconciliation-процедуры — шаблон сам их не обновляет.
 - `ACTIVATE` и `PROLONGATE` пока не синхронизируют External Squad.
 
+### One-time External Squad reconciliation
+
+Одноразовая утилита `scripts/reconcile_external_squads.py` назначает External Squad
+уже существующим пользователям Remnawave по категории пользовательской услуги в SHM:
+
+| SHM category | External Squad |
+|--------------|----------------|
+| `vpn-mz-test` | `VPN-for-Friends` |
+| `vpn-mz-fc` | `Friends-Connect` |
+
+Username в Remnawave: `us_<user_service_id>` (не `user_id`).
+
+По умолчанию выполняется **dry-run** (без изменений в Remnawave).
+
+**1. Dry-run**
+
+```bash
+export SHM_PASSWORD='...'
+export REMNAWAVE_TOKEN='...'
+
+python3 scripts/reconcile_external_squads.py \
+  --shm-base-url https://shm.example.com \
+  --shm-login admin \
+  --shm-password-env SHM_PASSWORD \
+  --remnawave-panel-url https://panel.example.com \
+  --remnawave-token-env REMNAWAVE_TOKEN \
+  --output ./reconcile-dry-run
+```
+
+В `--output` появятся `summary.json`, `plan.json`, `plan.csv`, `conflicts.csv`, `missing.csv`.
+
+**2. Просмотр отчёта**
+
+- `summary.json` — `plan_counts` (`already_correct` / `needs_assignment` / `conflict` / `missing_in_remnawave` / `error`)
+- `conflicts.csv` — пользователи с другим ненулевым External Squad (по умолчанию **не** изменяются)
+- `missing.csv` — `us_<user_service_id>` не найден в Remnawave
+
+**3. Apply** (только `needs_assignment`)
+
+Apply выполняется **последовательными синхронными** `PATCH /api/users`
+(по одному пользователю; между запросами — `--request-delay-ms`).
+Bulk-update не используется.
+
+```bash
+python3 scripts/reconcile_external_squads.py \
+  --shm-base-url https://shm.example.com \
+  --shm-login admin \
+  --shm-password-env SHM_PASSWORD \
+  --remnawave-panel-url https://panel.example.com \
+  --remnawave-token-env REMNAWAVE_TOKEN \
+  --output ./reconcile-apply \
+  --apply \
+  --confirm ASSIGN_EXTERNAL_SQUADS
+```
+
+Без пары `--apply` + `--confirm ASSIGN_EXTERNAL_SQUADS` изменения запрещены.
+
+Повторный запуск **идемпотентен**: уже назначенные пользователи попадают в
+`already_correct` и не изменяются; остаются только новые `needs_assignment`.
+
+После apply в `summary.json` добавляется блок `apply`
+(`requested` / `applied` / `failed` / `complete`).
+
+**4. Повторный dry-run после apply**
+
+Запустите dry-run ещё раз в **новый** пустой `--output`: записи из `needs_assignment`
+должны перейти в `already_correct`.
+
+**Важно:** не переключайте `SUBPAGE_CONFIG_UUID` на `00000000-0000-0000-0000-000000000000`
+до завершения reconciliation — иначе брендинг/Subpage Config может «отвалиться»
+у пользователей, которым External Squad ещё не назначен.
+
 ### Поведение лимитов по умолчанию
 
 Если параметры услуги не заданы, используются значения по умолчанию:
