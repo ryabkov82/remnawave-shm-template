@@ -54,11 +54,12 @@ remnawave:
 
 ## 🧩 Настройки услуги (опционально)
 
-Для конкретной услуги в SHM можно задать собственный Internal Squad:
+Для конкретной услуги в SHM можно задать собственный Internal Squad и опционально External Squad:
 
 ```yaml
 remnawave:
   internal_squad_name: AntiBlock-Squad
+  external_squad_name: VPN-for-Friends
   traffic_limit_bytes: 53687091200
   traffic_limit_strategy: MONTH
   hwid_device_limit: 2  
@@ -68,9 +69,27 @@ remnawave:
 | Параметр | Обязательный | Описание |
 |-----------|--------------|-----------|
 | `internal_squad_name`	| ⛔	| Internal Squad для пользователей этой услуги |
+| `external_squad_name` | ⛔ | Точное имя External Squad в Remnawave. UUID в SHM не хранится. Отсутствие параметра сохраняет прежнее поведение |
 | `traffic_limit_bytes` |	⛔ |	Лимит трафика в байтах. Если не задан — используется 0 (без ограничения) |
 | `traffic_limit_strategy` |	⛔ |	Стратегия сброса лимита трафика. Допустимые значения: NO_RESET, DAY, WEEK, MONTH |
 | `hwid_device_limit` |	⛔ |	Лимит устройств (HWID Device Limit). Если не задан — используется 0 (без ограничения) |
+
+`external_squad_name` отвечает только за бренд / Subpage Config.
+`internal_squad_name` по-прежнему определяет доступные ноды и inbound.
+
+Примеры настройки только External Squad (остальные параметры услуги без изменений):
+
+**VFF:**
+```yaml
+remnawave:
+  external_squad_name: VPN-for-Friends
+```
+
+**Friends Connect:**
+```yaml
+remnawave:
+  external_squad_name: Friends-Connect
+```
 
 ### Приоритет выбора Internal Squad
 
@@ -80,6 +99,14 @@ remnawave:
 2. `server.settings.remnawave.default_internal_squad_name`
 
 Это позволяет использовать один и тот же шаблон для нескольких тарифов и направлять пользователей в разные Internal Squad Remnawave.
+
+Для External Squad серверного fallback нет: параметр задаётся только на уровне услуги. Отсутствие или `null` означает, что External Squad не задан.
+
+### Поведение External Squad
+
+- Новые пользователи получают External Squad при событии `CREATE` (имя резолвится в UUID через `GET /api/external-squads`).
+- Существующие пользователи требуют отдельной reconciliation-процедуры — шаблон сам их не обновляет.
+- `ACTIVATE` и `PROLONGATE` пока не синхронизируют External Squad.
 
 ### Поведение лимитов по умолчанию
 

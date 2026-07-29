@@ -6,6 +6,13 @@
 # 2) fallback: server.settings.remnawave.default_internal_squad_name
 # UUID внутреннего сквада в SHM не хранится и всегда резолвится через API панели.
 #
+# External Squad задаётся опционально через
+# us.service.settings.remnawave.external_squad_name.
+# Хранится точное имя сквада, а не UUID.
+# Серверного fallback для External Squad нет.
+# Отсутствие или значение null означает, что External Squad не задан.
+# Имя резолвится в UUID через GET /api/external-squads только при CREATE.
+#
 set -euo pipefail
 
 # ---- SHM placeholders ----
@@ -20,6 +27,7 @@ DEFAULT_INTERNAL_SQUAD_NAME="{{ server.settings.remnawave.default_internal_squad
 
 # ---- us.service.settings.remnawave.* ----
 SERVICE_INTERNAL_SQUAD_NAME="{{ us.service.settings.remnawave.internal_squad_name }}"
+SERVICE_EXTERNAL_SQUAD_NAME="{{ us.service.settings.remnawave.external_squad_name }}"
 SERVICE_TRAFFIC_LIMIT_BYTES="{{ us.service.settings.remnawave.traffic_limit_bytes }}"
 SERVICE_TRAFFIC_LIMIT_STRATEGY="{{ us.service.settings.remnawave.traffic_limit_strategy }}"
 SERVICE_HWID_DEVICE_LIMIT="{{ us.service.settings.remnawave.hwid_device_limit }}"
@@ -115,6 +123,14 @@ _effective_internal_squad_name() {
   fi
 }
 
+_effective_external_squad_name() {
+  if [[ -n "${SERVICE_EXTERNAL_SQUAD_NAME:-}" && "${SERVICE_EXTERNAL_SQUAD_NAME}" != "null" ]]; then
+    echo "${SERVICE_EXTERNAL_SQUAD_NAME}"
+  else
+    echo ""
+  fi
+}
+
 _effective_traffic_limit_bytes() {
   local v="${SERVICE_TRAFFIC_LIMIT_BYTES:-}"
   [[ -n "${v}" && "${v}" != "null" ]] || { echo "0"; return; }
@@ -166,6 +182,20 @@ _resolve_internal_squad_uuid_by_name() {
   echo "${uuid}"
 }
 
+# Резолвим UUID внешнего сквада по точному ИМЕНИ (без кеша, без серверного fallback)
+_resolve_external_squad_uuid_by_name() {
+  local squad_name="$1"
+  [[ -n "${squad_name:-}" ]] || fail "external squad name is empty"
+
+  local uuid
+  uuid="$(_http_get "/api/external-squads" \
+    | jq -r --arg NAME "${squad_name}" '.response.externalSquads[] | select(.name==$NAME) | .uuid' \
+    | head -n1)"
+
+  [[ -n "${uuid}" ]] || fail "External Squad '${squad_name}' not found on panel ${PANEL_URL}"
+  echo "${uuid}"
+}
+
 # Actions
 _bulk_delete_users()        { local uuid="$1"; _http_post "/api/users/bulk/delete" --data "{\"uuids\":[\"${uuid}\"]}" >/dev/null; }
 _bulk_revoke_subscription() { local uuid="$1"; _http_post "/api/users/bulk/revoke-subscription" --data "{\"uuids\":[\"${uuid}\"]}" >/dev/null; }
@@ -181,6 +211,14 @@ _build_create_payload() {
   local traffic_limit_bytes="$(_effective_traffic_limit_bytes)"
   local traffic_limit_strategy="$(_effective_traffic_limit_strategy)"
   local hwid_device_limit="$(_effective_hwid_device_limit)"
+  local external_squad_name="$(_effective_external_squad_name)"
+  local external_squad_uuid_json="null"
+
+  if [[ -n "${external_squad_name}" ]]; then
+    local external_squad_uuid
+    external_squad_uuid="$(_resolve_external_squad_uuid_by_name "${external_squad_name}")"
+    external_squad_uuid_json="\"${external_squad_uuid}\""
+  fi
 
   cat <<JSON
 {
@@ -195,7 +233,7 @@ _build_create_payload() {
   "email": null,
   "hwidDeviceLimit": ${hwid_device_limit},
   "activeInternalSquads": ["${squad_uuid}"],
-  "externalSquadUuid": null
+  "externalSquadUuid": ${external_squad_uuid_json}
 }
 JSON
 }
@@ -233,6 +271,7 @@ case "${EVENT}" in
   CREATE)
     log "Create user ${USERNAME}"
     log "Effective internal squad: $(_effective_internal_squad_name)"
+    log "Effective external squad: $(_effective_external_squad_name)"
     _log_effective_limits
     payload="$(_build_create_payload)"
     resp="$(_http_post '/api/users' --data "${payload}")"
