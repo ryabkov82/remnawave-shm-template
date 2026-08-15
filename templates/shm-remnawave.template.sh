@@ -51,9 +51,10 @@ _auth_header() {
 }
 
 # HTTP helpers (Remnawave)
-_http_get()   { local p="$1"; shift; curl -skS -H "$(_auth_header)" "$@" "${PANEL_URL}${p}"; }
-_http_post()  { local p="$1"; shift; curl -skS -X POST -H "$(_auth_header)" -H 'Content-Type: application/json' "$@" "${PANEL_URL}${p}"; }
-_http_patch() { local p="$1"; shift; curl -skS -X PATCH -H "$(_auth_header)" -H 'Content-Type: application/json' "$@" "${PANEL_URL}${p}"; }
+_http_get()    { local p="$1"; shift; curl -skS -H "$(_auth_header)" "$@" "${PANEL_URL}${p}"; }
+_http_post()   { local p="$1"; shift; curl -skS --fail-with-body -X POST -H "$(_auth_header)" -H 'Content-Type: application/json' "$@" "${PANEL_URL}${p}"; }
+_http_patch()  { local p="$1"; shift; curl -skS --fail-with-body -X PATCH -H "$(_auth_header)" -H 'Content-Type: application/json' "$@" "${PANEL_URL}${p}"; }
+_http_delete() { local p="$1"; shift; curl -skS --fail-with-body -X DELETE -H "$(_auth_header)" "$@" "${PANEL_URL}${p}"; }
 
 # Helpers
 
@@ -99,9 +100,12 @@ _expire_iso() {
   date -u -d "@${final_epoch}" +"%Y-%m-%dT%H:%M:%SZ"
 }
 
-_user_uuid_by_username() {
+_user_id_by_username() {
   local username="$1"
-  _http_get "/api/users/by-username/${username}" | jq -r '.response.uuid // .response.user.uuid // empty'
+  local user_id
+  user_id="$(_http_get "/api/users/by-username/${username}" | jq -r '.response.id // empty')"
+  [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "User not found: ${username}"
+  echo "${user_id}"
 }
 
 _subscription_json_by_username() {
@@ -196,12 +200,17 @@ _resolve_external_squad_uuid_by_name() {
   echo "${uuid}"
 }
 
-# Actions
-_bulk_delete_users()        { local uuid="$1"; _http_post "/api/users/bulk/delete" --data "{\"uuids\":[\"${uuid}\"]}" >/dev/null; }
-_bulk_revoke_subscription() { local uuid="$1"; _http_post "/api/users/bulk/revoke-subscription" --data "{\"uuids\":[\"${uuid}\"]}" >/dev/null; }
-_reset_user_traffic()       { local uuid="$1"; _http_post "/api/users/${uuid}/actions/reset-traffic" --data '{}' >/dev/null; }
-_disable_user()             { local uuid="$1"; _http_post "/api/users/${uuid}/actions/disable" --data '{}' >/dev/null; }
-_enable_user()              { local uuid="$1"; _http_post "/api/users/${uuid}/actions/enable" --data '{}' >/dev/null; }
+# Actions (Remnawave 3.x numeric userId)
+_require_user_id() {
+  local user_id="$1"
+  [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "Invalid Remnawave user id: '${user_id}'"
+}
+
+_revoke_user_subscription() { local user_id="$1"; _require_user_id "${user_id}"; _http_post "/api/users/${user_id}/actions/revoke" --data '{}' >/dev/null; }
+_delete_user()              { local user_id="$1"; _require_user_id "${user_id}"; _http_delete "/api/users/${user_id}" >/dev/null; }
+_reset_user_traffic()       { local user_id="$1"; _require_user_id "${user_id}"; _http_post "/api/users/${user_id}/actions/reset-traffic" --data '{}' >/dev/null; }
+_disable_user()             { local user_id="$1"; _require_user_id "${user_id}"; _http_post "/api/users/${user_id}/actions/disable" --data '{}' >/dev/null; }
+_enable_user()              { local user_id="$1"; _require_user_id "${user_id}"; _http_post "/api/users/${user_id}/actions/enable" --data '{}' >/dev/null; }
 
 # Payloads
 _build_create_payload() {
@@ -239,7 +248,8 @@ JSON
 }
 
 _build_update_payload() {
-  local uuid="$1"
+  local user_id="$1"
+  _require_user_id "${user_id}"
   local expire_iso="$(_expire_iso)"
   local traffic_limit_bytes="$(_effective_traffic_limit_bytes)"
   local traffic_limit_strategy="$(_effective_traffic_limit_strategy)"
@@ -247,7 +257,7 @@ _build_update_payload() {
 
   cat <<JSON
 {
-  "uuid": "${uuid}",
+  "id": ${user_id},
   "status": "${STATUS_ACTIVE}",
   "trafficLimitBytes": ${traffic_limit_bytes},
   "trafficLimitStrategy": "${traffic_limit_strategy}",
@@ -275,8 +285,8 @@ case "${EVENT}" in
     _log_effective_limits
     payload="$(_build_create_payload)"
     resp="$(_http_post '/api/users' --data "${payload}")"
-    uuid="$(echo "${resp}" | jq -r '.response.user.uuid // .response.uuid // empty')"
-    [[ -n "${uuid}" ]] || fail "Create user failed: ${resp}"
+    user_id="$(echo "${resp}" | jq -r '.response.id // empty')"
+    [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "Create user failed: ${resp}"
 
     log "Fetch subscription JSON"
     sub_json="$(_subscription_json_by_username "${USERNAME_SANITIZED}")"
@@ -296,31 +306,28 @@ case "${EVENT}" in
 
   ACTIVATE)
     log "Activate ${USERNAME_SANITIZED}"
-    uuid="$(_user_uuid_by_username "${USERNAME_SANITIZED}")"
-    [[ -n "${uuid}" ]] || fail "User not found: ${USERNAME}"
+    user_id="$(_user_id_by_username "${USERNAME_SANITIZED}")"
 
-    _enable_user "${uuid}"
+    _enable_user "${user_id}"
     _log_effective_limits
-    payload="$(_build_update_payload "${uuid}")"
+    payload="$(_build_update_payload "${user_id}")"
     _http_patch "/api/users" --data "${payload}" >/dev/null
     log "done"
     ;;
 
   BLOCK)
     log "Block ${USERNAME_SANITIZED}"
-    uuid="$(_user_uuid_by_username "${USERNAME_SANITIZED}")"
-    [[ -n "${uuid}" ]] || fail "User not found: ${USERNAME}"
-    _disable_user "${uuid}"
+    user_id="$(_user_id_by_username "${USERNAME_SANITIZED}")"
+    _disable_user "${user_id}"
     log "done"
     ;;
 
   REMOVE)
     log "Remove ${USERNAME_SANITIZED}"
-    uuid="$(_user_uuid_by_username "${USERNAME_SANITIZED}")"
-    [[ -n "${uuid}" ]] || fail "User not found: ${USERNAME}"
+    user_id="$(_user_id_by_username "${USERNAME_SANITIZED}")"
 
-    _bulk_revoke_subscription "${uuid}"
-    _bulk_delete_users "${uuid}"
+    _revoke_user_subscription "${user_id}"
+    _delete_user "${user_id}"
 
     log "Delete SHM key vpn_mrzb_{{ us.id }}"
     curl -skS -X DELETE -H "session-id: ${SESSION_ID}" "${API_URL}/shm/v1/storage/manage/vpn_mrzb_{{ us.id }}" >/dev/null || true
@@ -329,12 +336,11 @@ case "${EVENT}" in
 
   PROLONGATE)
     log "Prolongate ${USERNAME_SANITIZED} + reset traffic"
-    uuid="$(_user_uuid_by_username "${USERNAME_SANITIZED}")"
-    [[ -n "${uuid}" ]] || fail "User not found: ${USERNAME}"
+    user_id="$(_user_id_by_username "${USERNAME_SANITIZED}")"
 
-    _reset_user_traffic "${uuid}"
+    _reset_user_traffic "${user_id}"
     _log_effective_limits
-    payload="$(_build_update_payload "${uuid}")"
+    payload="$(_build_update_payload "${user_id}")"
     _http_patch "/api/users" --data "${payload}" >/dev/null
     log "done"
     ;;
