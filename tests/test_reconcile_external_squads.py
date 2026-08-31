@@ -19,7 +19,10 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "scripts"
+sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(SCRIPTS))
+
+from tests.proxy_env import DisableEnvProxiesMixin  # noqa: E402
 
 import reconcile_external_squads as rec  # noqa: E402
 
@@ -266,15 +269,17 @@ def start_server() -> Tuple[ThreadingHTTPServer, str]:
     return server, f"http://{host}:{port}"
 
 
-class ReconcileTests(unittest.TestCase):
+class ReconcileTests(DisableEnvProxiesMixin, unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        super().setUpClass()
         cls.server, cls.base_url = start_server()
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.server.shutdown()
         cls.server.server_close()
+        super().tearDownClass()
 
     def setUp(self) -> None:
         STATE.reset()

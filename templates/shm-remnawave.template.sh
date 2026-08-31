@@ -13,6 +13,14 @@
 # Отсутствие или значение null означает, что External Squad не задан.
 # Имя резолвится в UUID через GET /api/external-squads только при CREATE.
 #
+# HWID device limit (us.service.settings.remnawave.hwid_device_limit):
+#   absent/null -> inherit Remnawave panel default (CREATE and UPDATE: omit field)
+#   0           -> disable HWID limit for this user (CREATE and UPDATE send 0)
+#   N > 0       -> explicit per-user limit N (CREATE and UPDATE send N)
+# 0 is not a fallback for a missing setting. null != 0.
+# Lifecycle UPDATE never sends JSON null: it cannot reset an existing explicit
+# Remnawave value back to panel default. That reset is reconciliation-only.
+#
 set -euo pipefail
 
 # ---- SHM placeholders ----
@@ -158,18 +166,43 @@ _effective_traffic_limit_strategy() {
   esac
 }
 
-_effective_hwid_device_limit() {
+# Validate in the current shell (not in $(...)): `local x="$(fail)"` would swallow exit.
+_validate_hwid_device_limit() {
   local v="${SERVICE_HWID_DEVICE_LIMIT:-}"
-  [[ -n "${v}" && "${v}" != "null" ]] || { echo "0"; return; }
+  if [[ -z "${v}" || "${v}" == "null" ]]; then
+    return 0
+  fi
+  [[ "${v}" =~ ^[0-9]+$ ]] || fail "Invalid hwid_device_limit: '${v}' (must be non-negative integer or null)"
+}
 
-  [[ "${v}" =~ ^[0-9]+$ ]] || fail "Invalid hwid_device_limit: '${v}' (must be non-negative integer)"
+# Prints empty string for absent/null (panel default), otherwise a non-negative integer.
+# Does not use 0 as a fallback for a missing setting.
+_effective_hwid_device_limit() {
+  _validate_hwid_device_limit
+  local v="${SERVICE_HWID_DEVICE_LIMIT:-}"
+  if [[ -z "${v}" || "${v}" == "null" ]]; then
+    echo ""
+    return
+  fi
   echo "${v}"
+}
+
+_hwid_device_limit_log_label() {
+  _validate_hwid_device_limit
+  local v="${SERVICE_HWID_DEVICE_LIMIT:-}"
+  if [[ -z "${v}" || "${v}" == "null" ]]; then
+    echo "panel default"
+  elif [[ "${v}" == "0" ]]; then
+    echo "disabled (0)"
+  else
+    echo "${v}"
+  fi
 }
 
 _log_effective_limits() {
   log "Effective traffic limit bytes: $(_effective_traffic_limit_bytes)"
   log "Effective traffic reset strategy: $(_effective_traffic_limit_strategy)"
-  log "Effective HWID device limit: $(_effective_hwid_device_limit)"
+  log "Effective HWID device limit: $(_hwid_device_limit_log_label)"
 }
 
 # Всегда резолвим UUID внутреннего сквада по ИМЕНИ (без кеша)
@@ -214,14 +247,21 @@ _enable_user()              { local user_id="$1"; _require_user_id "${user_id}";
 
 # Payloads
 _build_create_payload() {
+  _validate_hwid_device_limit
   local expire_iso="$(_expire_iso)"
   local squad_name="$(_effective_internal_squad_name)"
   local squad_uuid="$(_resolve_internal_squad_uuid_by_name "${squad_name}")"
   local traffic_limit_bytes="$(_effective_traffic_limit_bytes)"
   local traffic_limit_strategy="$(_effective_traffic_limit_strategy)"
-  local hwid_device_limit="$(_effective_hwid_device_limit)"
+  local hwid_device_limit
+  hwid_device_limit="$(_effective_hwid_device_limit)"
+  local hwid_create_line=""
   local external_squad_name="$(_effective_external_squad_name)"
   local external_squad_uuid_json="null"
+
+  if [[ -n "${hwid_device_limit}" ]]; then
+    hwid_create_line="  \"hwidDeviceLimit\": ${hwid_device_limit},"
+  fi
 
   if [[ -n "${external_squad_name}" ]]; then
     local external_squad_uuid
@@ -240,7 +280,7 @@ _build_create_payload() {
   "tag": null,
   "telegramId": null,
   "email": null,
-  "hwidDeviceLimit": ${hwid_device_limit},
+${hwid_create_line}
   "activeInternalSquads": ["${squad_uuid}"],
   "externalSquadUuid": ${external_squad_uuid_json}
 }
@@ -250,10 +290,19 @@ JSON
 _build_update_payload() {
   local user_id="$1"
   _require_user_id "${user_id}"
+  _validate_hwid_device_limit
   local expire_iso="$(_expire_iso)"
   local traffic_limit_bytes="$(_effective_traffic_limit_bytes)"
   local traffic_limit_strategy="$(_effective_traffic_limit_strategy)"
-  local hwid_device_limit="$(_effective_hwid_device_limit)"
+  local hwid_device_limit
+  hwid_device_limit="$(_effective_hwid_device_limit)"
+  local hwid_update_comma=""
+  local hwid_update_line=""
+
+  if [[ -n "${hwid_device_limit}" ]]; then
+    hwid_update_comma=","
+    hwid_update_line="  \"hwidDeviceLimit\": ${hwid_device_limit}"
+  fi
 
   cat <<JSON
 {
@@ -261,8 +310,8 @@ _build_update_payload() {
   "status": "${STATUS_ACTIVE}",
   "trafficLimitBytes": ${traffic_limit_bytes},
   "trafficLimitStrategy": "${traffic_limit_strategy}",
-  "expireAt": "${expire_iso}",
-  "hwidDeviceLimit": ${hwid_device_limit}
+  "expireAt": "${expire_iso}"${hwid_update_comma}
+${hwid_update_line}
 }
 JSON
 }

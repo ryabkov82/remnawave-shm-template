@@ -72,7 +72,7 @@ remnawave:
 | `external_squad_name` | ⛔ | Точное имя External Squad в Remnawave. UUID в SHM не хранится. Отсутствие параметра сохраняет прежнее поведение |
 | `traffic_limit_bytes` |	⛔ |	Лимит трафика в байтах. Если не задан — используется 0 (без ограничения) |
 | `traffic_limit_strategy` |	⛔ |	Стратегия сброса лимита трафика. Допустимые значения: NO_RESET, DAY, WEEK, MONTH |
-| `hwid_device_limit` |	⛔ |	Лимит устройств (HWID Device Limit). Если не задан — используется 0 (без ограничения) |
+| `hwid_device_limit` |	⛔ |	Лимит устройств (HWID Device Limit). Три состояния: отсутствует/`null` — глобальный HWID limit Remnawave; `0` — лимит отключён индивидуально; `N > 0` — индивидуальный лимит `N` |
 
 `external_squad_name` отвечает только за бренд / Subpage Config.
 `internal_squad_name` по-прежнему определяет доступные ноды и inbound.
@@ -182,13 +182,119 @@ python3 scripts/reconcile_external_squads.py \
 
 ### Поведение лимитов по умолчанию
 
-Если параметры услуги не заданы, используются значения по умолчанию:
+Если параметры услуги не заданы:
 
-traffic_limit_bytes = 0
-traffic_limit_strategy = NO_RESET
-hwid_device_limit = 0
+- `traffic_limit_bytes` = `0` (без ограничения трафика)
+- `traffic_limit_strategy` = `NO_RESET`
 
-То есть старые услуги без этих настроек продолжают работать как раньше.
+`hwid_device_limit` — отдельная семантика, `null` и `0` здесь не одно и то же:
+
+| SHM `hwid_device_limit` | Remnawave `hwidDeviceLimit` | Смысл |
+|-------------------------|-----------------------------|--------|
+| отсутствует или `null` | поле не отправляется (CREATE и UPDATE) | используется **глобальный** HWID device limit панели Remnawave |
+| `0` | `0` | HWID-лимит **отключён индивидуально** для этого пользователя |
+| `N > 0` | `N` | индивидуальный лимит `N` устройств |
+
+Значение глобального fallback задаётся в панели Remnawave и **не** захардкожено в шаблоне.
+
+На CREATE Remnawave не принимает `hwidDeviceLimit: null`, поэтому при отсутствии/`null` настройки ключ в payload отсутствует. На `ACTIVATE` / `PROLONGATE` (PATCH) шаблон тоже **не** отправляет `hwidDeviceLimit`: явный `0` или `N > 0` пишутся, а absent/`null` ключ опускает. Lifecycle-событие не сбрасывает уже записанный в панели explicit value (`0` или `N`) обратно к panel default.
+
+Переход существующего explicit `hwidDeviceLimit` к наследованию глобального fallback выполняется только **reconciliation** (`scripts/reconcile_hwid_limits.py`), не шаблоном.
+
+То есть старые услуги без `hwid_device_limit` больше не получают индивидуальный `0` на CREATE; уже существующий `0` в панели сам по себе не мигрируется через `ACTIVATE`/`PROLONGATE`.
+
+### One-time HWID device limit reconciliation
+
+Одноразовая утилита `scripts/reconcile_hwid_limits.py` сверяет
+`hwidDeviceLimit` существующих пользователей Remnawave с настройкой
+конкретной услуги SHM (`us.service.settings.remnawave.hwid_device_limit`).
+
+Username в Remnawave: `us_<user_service_id>` (не `user_id`).
+
+Целевое значение считается **по услуге**, а не «все нули в панели → null»:
+явное `hwid_device_limit: 0` в SHM сохраняется как `0`.
+
+Пользователи, для которых нельзя уверенно сопоставить user-service SHM
+и каталог услуги, не изменяются.
+
+По умолчанию выполняется **dry-run** (без изменений в Remnawave).
+
+**1. Dry-run**
+
+```bash
+export SHM_PASSWORD='...'
+export REMNAWAVE_TOKEN='...'
+
+python3 scripts/reconcile_hwid_limits.py \
+  --shm-base-url https://shm.example.com \
+  --shm-login admin \
+  --shm-password-env SHM_PASSWORD \
+  --remnawave-panel-url https://panel.example.com \
+  --remnawave-token-env REMNAWAVE_TOKEN \
+  --output ./reconcile-hwid-dry-run
+```
+
+Опционально ограничить категории: `--category vpn-mz-test --category vpn-mz-fc`.
+
+В `--output` появятся `summary.json`, `plan.json`, `plan.csv`, `errors.csv`, `missing.csv`.
+
+**2. Просмотр отчёта**
+
+- `summary.json` — `plan_counts` и `hwid_snapshot`:
+  сколько сейчас имеют `0`, сколько из них должны стать `null`,
+  сколько должны сохранить `0`, сколько имеют явный индивидуальный limit,
+  сколько уже соответствуют SHM, сколько нельзя безопасно классифицировать
+- классификации: `already_correct` / `needs_reset_to_panel_default` /
+  `needs_set_explicit_limit` / `needs_disable_limit` /
+  `missing_in_remnawave` / `invalid_shm_setting` / `error`
+- `target_resolved=true` + `target_hwid_device_limit: null` — валидная цель
+  (panel default); у `invalid_shm_setting` ключ цели отсутствует и
+  `target_resolved=false` (это не reset)
+- `errors.csv` — невалидная настройка SHM или ошибка резолва
+- `missing.csv` — `us_<user_service_id>` не найден в Remnawave
+
+**3. Apply** (только allow-list ∩ mutation-class, без drift)
+
+Apply выполняется **последовательными синхронными** `PATCH /api/users`
+(по одному пользователю; между запросами — `--request-delay-ms`).
+Bulk-update не используется. После каждого PATCH пользователь заново
+читается и сверяется `hwidDeviceLimit` (включая JSON `null`).
+
+`--apply` требует явный allow-list `--apply-username` (можно повторять).
+Allow-list — **дополнительное** ограничение, не обход плана:
+
+- пользователь должен быть в mutation-class
+  (`needs_reset_to_panel_default` / `needs_set_explicit_limit` /
+  `needs_disable_limit`);
+- `already_correct`, `missing_in_remnawave`, `invalid_shm_setting`, `error`
+  не PATCHатся даже если username в списке;
+- перед PATCH повторно читается Remnawave: `id`, current и classification
+  должны совпасть с планом; drift блокирует PATCH и останавливает apply.
+
+```bash
+python3 scripts/reconcile_hwid_limits.py \
+  --shm-base-url https://shm.example.com \
+  --shm-login admin \
+  --shm-password-env SHM_PASSWORD \
+  --remnawave-panel-url https://panel.example.com \
+  --remnawave-token-env REMNAWAVE_TOKEN \
+  --output ./reconcile-hwid-apply \
+  --apply \
+  --confirm RECONCILE_HWID_LIMITS \
+  --apply-username us_123 \
+  --apply-username us_456
+```
+
+Без `--apply` + `--confirm RECONCILE_HWID_LIMITS` + хотя бы одного
+`--apply-username` изменения запрещены.
+
+Повторный запуск **идемпотентен**: уже приведённые пользователи попадают в
+`already_correct` и не изменяются.
+
+**4. Повторный dry-run после apply**
+
+Запустите dry-run ещё раз в **новый** пустой `--output`: изменённые записи
+должны перейти в `already_correct`.
 
 ---
 
