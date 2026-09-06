@@ -296,6 +296,157 @@ python3 scripts/reconcile_hwid_limits.py \
 Запустите dry-run ещё раз в **новый** пустой `--output`: изменённые записи
 должны перейти в `already_correct`.
 
+### One-time Traffic Limit reconciliation
+
+Одноразовая утилита `scripts/reconcile_traffic_limits.py` сверяет
+`trafficLimitBytes` / `trafficLimitStrategy` существующих пользователей
+Remnawave с настройками конкретной услуги SHM:
+
+- `us.service.settings.remnawave.traffic_limit_bytes`
+- `us.service.settings.remnawave.traffic_limit_strategy`
+
+Source of truth — **настройки услуги SHM**, не Internal Squad и не имя
+тарифа. Standard / другие планы определяются только тем, что явно записано
+в `service.settings.remnawave`.
+
+В отличие от lifecycle-шаблона и от HWID reconciliation:
+
+- отсутствие блока `remnawave` или ключа `traffic_limit_bytes` —
+  `unmanaged_service`, **не** `target=0`;
+- массовый reconciliation не должен случайно сбросить уже существующий
+  лимит на услуге, которая ещё не переведена на новую policy;
+- если `traffic_limit_bytes` задан, `traffic_limit_strategy` тоже должна
+  быть явной и валидной (`NO_RESET` / `DAY` / `WEEK` / `MONTH`).
+  Fallback не угадывается. `MONTH_ROLLING` backend 3.2.3 принимает,
+  текущий SHM template — нет; такое значение в SHM = `invalid_shm_setting`.
+
+Username в Remnawave: `us_<user_service_id>` (не `user_id`).
+
+По умолчанию выполняется **dry-run** (без изменений в Remnawave).
+Трафик **не** сбрасывается: нет вызова `/actions/reset-traffic` и нет
+записи `usedTrafficBytes` / `lastTrafficResetAt` / `status`.
+`NO_RESET` для Standard корректен: календарный reset в Remnawave не нужен,
+сброс трафика выполняет SHM `PROLONGATE`.
+
+**1. Dry-run**
+
+```bash
+export SHM_PASSWORD='...'
+export REMNAWAVE_TOKEN='...'
+
+python3 scripts/reconcile_traffic_limits.py \
+  --shm-base-url https://shm.example.com \
+  --shm-login admin \
+  --shm-password-env SHM_PASSWORD \
+  --remnawave-panel-url https://panel.example.com \
+  --remnawave-token-env REMNAWAVE_TOKEN \
+  --output ./reconcile-traffic-dry-run
+```
+
+Опционально ограничить выборку: `--category vpn-mz-test` (можно повторять)
+и/или `--service-id 6` (можно повторять).
+
+В `--output` появятся `summary.json`, `plan.json`, `plan.csv`,
+`errors.csv`, `missing.csv`, `over_limit.csv`.
+
+**2. Просмотр отчёта**
+
+- `summary.json` — `total_user_services_inspected`, `managed_users`,
+  `plan_counts`, `risk.would_be_over_limit_now_count`,
+  `target_combinations` (bytes + strategy + users_count)
+- классификации: `already_correct` / `needs_set_limit` /
+  `needs_set_strategy` / `needs_set_limit_and_strategy` /
+  `unmanaged_service` / `missing_in_remnawave` /
+  `invalid_shm_setting` / `error`
+- `would_be_over_limit_now` — risk-поле, не отдельная mutation-class:
+  `target_limit_bytes > 0` и `usedTrafficBytes >= target`
+- `over_limit.csv` — только такие пользователи
+- `errors.csv` — невалидная настройка SHM или ошибка резолва
+- `missing.csv` — `us_<user_service_id>` не найден в Remnawave
+
+**3. Apply** (только scoped mutation-class, без unscoped прогона)
+
+Apply выполняется **последовательными синхронными** `PATCH /api/users`
+с телом только:
+
+```json
+{"id": <numeric user id>, "trafficLimitBytes": <target>, "trafficLimitStrategy": "<target>"}
+```
+
+Bulk-update и reset-traffic не используются. Перед каждым PATCH live-user
+и target перепроверяются. `usedTrafficBytes` — живой счётчик: рост
+между plan и PATCH допустим, уменьшение (вероятный reset) останавливает
+apply. После PATCH сверяются `trafficLimitBytes`, `trafficLimitStrategy`,
+`status`, `expireAt`, HWID и squads; `usedTrafficBytes` должен быть
+`>= pre-PATCH`. Unexpected decrease/status drift останавливает apply.
+
+`--apply` требует одновременно:
+
+- `--confirm RECONCILE_TRAFFIC_LIMITS`;
+- хотя бы один `--category` или `--service-id` (unscoped apply запрещён).
+
+Опциональный `--apply-username` (можно повторять) — **дополнительная**
+allow-list поверх scope. Она сужает mutation set, но **не** заменяет
+обязательный `--category` / `--service-id` и **не** обходит
+`would_be_over_limit_now` / non-mutation classes.
+
+Итоговый mutation set:
+
+`category/service-id scope` ∩ `needs_set_*` ∩ `--apply-username`
+(если задан) ∩ over-limit safety.
+
+`--apply --apply-username us_1001` без `--category`/`--service-id`
+запрещён.
+
+Пользователи с `would_be_over_limit_now=true` **не** PATCH-аются, пока
+не передан `--include-over-limit` — даже если username в allow-list.
+После установки лимита Remnawave может почти сразу перевести такого
+пользователя в `LIMITED`.
+
+**Canary**
+
+```bash
+python3 scripts/reconcile_traffic_limits.py \
+  --shm-base-url https://shm.example.com \
+  --shm-login admin \
+  --shm-password-env SHM_PASSWORD \
+  --remnawave-panel-url https://panel.example.com \
+  --remnawave-token-env REMNAWAVE_TOKEN \
+  --output ./reconcile-traffic-canary \
+  --service-id 3 \
+  --apply-username us_1001 \
+  --apply-username us_1002 \
+  --apply \
+  --confirm RECONCILE_TRAFFIC_LIMITS
+```
+
+**Scoped apply** (все mutation-class в выбранных услугах)
+
+```bash
+python3 scripts/reconcile_traffic_limits.py \
+  --shm-base-url https://shm.example.com \
+  --shm-login admin \
+  --shm-password-env SHM_PASSWORD \
+  --remnawave-panel-url https://panel.example.com \
+  --remnawave-token-env REMNAWAVE_TOKEN \
+  --output ./reconcile-traffic-apply \
+  --service-id 3 \
+  --service-id 4 \
+  --apply \
+  --confirm RECONCILE_TRAFFIC_LIMITS
+```
+
+Без `--apply` + `--confirm RECONCILE_TRAFFIC_LIMITS` + scoped
+`--category`/`--service-id` изменения запрещены.
+
+Повторный запуск **идемпотентен**: уже приведённые пользователи попадают в
+`already_correct`, `usedTrafficBytes` остаётся прежним.
+
+**4. Повторный dry-run после apply**
+
+Запустите dry-run ещё раз в **новый** пустой `--output`: записи
+`needs_*` должны перейти в `already_correct`.
+
 ---
 
 ## 🧹 Опция sanitize_username
