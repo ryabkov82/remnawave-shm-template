@@ -14,12 +14,19 @@ plus createdAt < --migration-cutoff and no reset since that cutoff.
 
 Dry-run is the default. ``potential_after_month_migration`` is
 informational only and never authorizes apply.
+
+``--apply`` takes a process-level exclusive flock on a global lock
+file (default ``/tmp/vff-reset-traffic-migration.lock``) before any
+live mutation. The lock is same-host only; it is not a distributed
+lock. Sequential retry still relies on ``--migration-cutoff``.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import fcntl
+import json
 import math
 import os
 import signal
@@ -68,6 +75,11 @@ CONFIRM_PHRASE = "RESET_MONTHLY_TRAFFIC_MIGRATION"
 HTTP_TIMEOUT_SEC = 30
 VERIFY_RETRY_ATTEMPTS = 5
 VERIFY_RETRY_DELAY_SEC = 1.0
+DEFAULT_APPLY_LOCK_FILE = "/tmp/vff-reset-traffic-migration.lock"
+CONCURRENT_APPLY_MESSAGE = (
+    "Another reset traffic migration apply is already running. "
+    "Refusing concurrent apply."
+)
 
 EXPECTED_LIMIT_BYTES = 322122547200
 EXPECTED_STRATEGY = "MONTH"
@@ -149,6 +161,7 @@ class ResetConfig:
     apply: bool = False
     confirm: Optional[str] = None
     apply_usernames: Tuple[str, ...] = ()
+    lock_file: str = DEFAULT_APPLY_LOCK_FILE
     http_timeout: float = HTTP_TIMEOUT_SEC
     verify_retry_attempts: int = VERIFY_RETRY_ATTEMPTS
     verify_retry_delay_sec: float = VERIFY_RETRY_DELAY_SEC
@@ -215,6 +228,72 @@ class PlanRow:
             "potential_after_month_migration": self.potential_after_month_migration,
             "error_message": self.error_message,
         }
+
+
+class ConcurrentApplyError(FatalError):
+    """Raised when another --apply already holds the exclusive flock."""
+
+
+class ApplyLock:
+    """Exclusive non-blocking flock for one-host apply serialization.
+
+    The lock file path is global to this tool, not inside ``--output``.
+    File contents are diagnostics only; a stale file without a held
+    flock never blocks a later apply.
+    """
+
+    def __init__(self, path: str) -> None:
+        if not path or not str(path).strip():
+            raise FatalError("--lock-file must be a non-empty path")
+        self.path = os.path.abspath(str(path).strip())
+        self._fd: Optional[int] = None
+
+    def acquire(self, metadata: Dict[str, Any]) -> None:
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise ConcurrentApplyError(CONCURRENT_APPLY_MESSAGE) from exc
+        self._fd = fd
+        self._write_metadata(metadata)
+
+    def _write_metadata(self, metadata: Dict[str, Any]) -> None:
+        if self._fd is None:
+            return
+        payload = json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8")
+        os.ftruncate(self._fd, 0)
+        os.lseek(self._fd, 0, os.SEEK_SET)
+        os.write(self._fd, payload)
+
+    def release(self) -> None:
+        fd = self._fd
+        self._fd = None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def __enter__(self) -> "ApplyLock":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.release()
+
+
+def build_apply_lock_metadata(cfg: ResetConfig) -> Dict[str, Any]:
+    return {
+        "pid": os.getpid(),
+        "started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "migration_cutoff": cfg.migration_cutoff_raw,
+        "service_ids": list(cfg.service_ids),
+        "categories": list(cfg.categories),
+    }
 
 
 class MutationGuard:
@@ -898,6 +977,8 @@ def summarize(rows: Sequence[PlanRow], cfg: ResetConfig) -> Dict[str, Any]:
         },
         "planned_strategy_impact": planned_strategy_impact(rows),
         "apply_never_uses_potential_field": True,
+        "apply_lock_path": cfg.lock_file if cfg.apply else None,
+        "apply_lock_acquired": bool(cfg.apply),
     }
 
 
@@ -1299,6 +1380,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "constraint: does not replace --category/--service-id scope."
         ),
     )
+    parser.add_argument(
+        "--lock-file",
+        default=DEFAULT_APPLY_LOCK_FILE,
+        help=(
+            "Global exclusive flock path for --apply "
+            f"(default: {DEFAULT_APPLY_LOCK_FILE}). "
+            "Same-host only; not a distributed lock. Dry-run ignores it."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1324,6 +1414,9 @@ def config_from_args(
     categories = tuple(args.category or ())
     apply_usernames = parse_apply_usernames(args.apply_usernames or ())
     cutoff = parse_migration_cutoff(args.migration_cutoff)
+    lock_file = str(getattr(args, "lock_file", DEFAULT_APPLY_LOCK_FILE) or "").strip()
+    if not lock_file:
+        raise FatalError("--lock-file must be a non-empty path")
     if bool(args.apply) and not categories and not service_ids:
         raise FatalError(
             "apply refused: require at least one --category or --service-id"
@@ -1344,6 +1437,7 @@ def config_from_args(
         apply=bool(args.apply),
         confirm=args.confirm,
         apply_usernames=apply_usernames,
+        lock_file=lock_file,
     )
 
 
@@ -1363,6 +1457,7 @@ def run(cfg: ResetConfig, client: Optional[HttpClient] = None) -> int:
         interrupted=lambda: interrupted_flag["value"],
     )
     http: HttpClient = MutationGuard(raw_client)  # type: ignore[assignment]
+    apply_lock: Optional[ApplyLock] = None
 
     try:
         if cfg.apply:
@@ -1375,6 +1470,9 @@ def run(cfg: ResetConfig, client: Optional[HttpClient] = None) -> int:
                 raise FatalError(
                     "apply refused: require at least one --category or --service-id"
                 )
+            apply_lock = ApplyLock(cfg.lock_file)
+            apply_lock.acquire(build_apply_lock_metadata(cfg))
+            log(f"Apply lock acquired: {apply_lock.path}")
 
         log(
             "Monthly traffic migration plan; cutoff="
@@ -1446,10 +1544,15 @@ def run(cfg: ResetConfig, client: Optional[HttpClient] = None) -> int:
     except Interrupted as exc:
         log(redact_secrets(str(exc), [cfg.shm_password, cfg.remnawave_token]))
         return 130
+    except ConcurrentApplyError as exc:
+        log(str(exc))
+        return 1
     except FatalError as exc:
         log(redact_secrets(str(exc), [cfg.shm_password, cfg.remnawave_token]))
         return 1
     finally:
+        if apply_lock is not None:
+            apply_lock.release()
         for sig, handler in previous_handlers.items():
             signal.signal(sig, handler)
 

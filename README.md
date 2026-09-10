@@ -564,6 +564,9 @@ Apply требует одновременно:
 - `--confirm RESET_MONTHLY_TRAFFIC_MIGRATION`
 - хотя бы один `--category` или `--service-id`
 - `--migration-cutoff`
+- exclusive flock на `--lock-file` (default
+  `/tmp/vff-reset-traffic-migration.lock`; см. Concurrent apply
+  protection ниже)
 
 Unscoped apply и apply без cutoff запрещены.
 `--apply-username` (можно повторять) — дополнительная allow-list
@@ -606,6 +609,40 @@ python3 scripts/reset_traffic_migration.py \
   --apply \
   --confirm RESET_MONTHLY_TRAFFIC_MIGRATION
 ```
+
+**Concurrent apply protection**
+
+`--migration-cutoff` даёт **последовательную** идемпотентность:
+`lastTrafficResetAt >= cutoff` → `already_reset_since_cutoff`, повторный
+прогон с тем же cutoff не делает второй reset.
+
+Cutoff **не** делает GET + `POST /actions/reset-traffic` атомарными.
+Два параллельных `--apply` с одним cutoff и разными `--output` могут
+оба увидеть `lastTrafficResetAt < cutoff` и оба вызвать reset.
+
+Поэтому `--apply` берёт exclusive non-blocking flock
+(`LOCK_EX | LOCK_NB`) на **глобальный** lock file, не внутри
+`--output`:
+
+- default: `/tmp/vff-reset-traffic-migration.lock`
+- override: `--lock-file PATH`
+
+Второй concurrent apply сразу завершается с ненулевым кодом и
+сообщением `Refusing concurrent apply`, **до** первого reset POST.
+Ждать lock он не будет. Dry-run flock не берёт: два dry-run могут
+идти параллельно. Во время live apply второй apply запускать не нужно;
+dry-run допустим, но его snapshot может быть transient.
+
+Это **same-host / same-filesystem** защита, не distributed lock.
+Live migration apply запускать только с одного operator host, а
+`--lock-file` должен лежать на общем для этих запусков local
+filesystem. Stale lock file без удерживаемого flock следующий apply
+не блокирует.
+
+Урок инцидента: два overlapping full apply с одним cutoff дали
+дублирующие reset POST части пользователей. Sequential retry после
+этого был идемпотентен; concurrent apply — нет. Cutoff остаётся
+обязательным; flock добавляется поверх него.
 
 ---
 

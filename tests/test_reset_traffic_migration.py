@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -326,12 +327,76 @@ class ParseAndClassifyTests(unittest.TestCase):
                 )
         self.assertIn("--migration-cutoff", stderr.getvalue())
 
+    def test_lock_file_cli_default_and_custom(self) -> None:
+        common = [
+            "--shm-base-url",
+            "https://shm.test",
+            "--shm-login",
+            "admin",
+            "--shm-password-env",
+            "SHM_PASSWORD",
+            "--remnawave-panel-url",
+            "https://panel.test",
+            "--remnawave-token-env",
+            "REMNAWAVE_TOKEN",
+            "--output",
+            "/tmp/out",
+            "--migration-cutoff",
+            CUTOFF_RAW,
+            "--service-id",
+            "3",
+        ]
+        default_args = rst.parse_args(common)
+        self.assertEqual(default_args.lock_file, rst.DEFAULT_APPLY_LOCK_FILE)
+        custom_args = rst.parse_args(common + ["--lock-file", "/tmp/custom-reset.lock"])
+        self.assertEqual(custom_args.lock_file, "/tmp/custom-reset.lock")
+        env = {"SHM_PASSWORD": SHM_PASSWORD, "REMNAWAVE_TOKEN": RW_TOKEN}
+        cfg = rst.config_from_args(custom_args, environ=env)
+        self.assertEqual(cfg.lock_file, "/tmp/custom-reset.lock")
+        metadata = rst.build_apply_lock_metadata(cfg)
+        blob = json.dumps(metadata)
+        self.assertNotIn(SHM_PASSWORD, blob)
+        self.assertNotIn(RW_TOKEN, blob)
+        self.assertNotIn("admin", blob)
+        self.assertEqual(metadata["migration_cutoff"], CUTOFF_RAW)
+        self.assertEqual(metadata["service_ids"], ["3"])
+
+    def test_empty_lock_file_refused(self) -> None:
+        env = {"SHM_PASSWORD": SHM_PASSWORD, "REMNAWAVE_TOKEN": RW_TOKEN}
+        args = rst.parse_args(
+            [
+                "--shm-base-url",
+                "https://shm.test",
+                "--shm-login",
+                "admin",
+                "--shm-password-env",
+                "SHM_PASSWORD",
+                "--remnawave-panel-url",
+                "https://panel.test",
+                "--remnawave-token-env",
+                "REMNAWAVE_TOKEN",
+                "--output",
+                "/tmp/out",
+                "--migration-cutoff",
+                CUTOFF_RAW,
+                "--service-id",
+                "3",
+                "--lock-file",
+                "   ",
+            ]
+        )
+        with self.assertRaises(rst.FatalError) as ctx:
+            rst.config_from_args(args, environ=env)
+        self.assertIn("--lock-file", str(ctx.exception))
+
     def test_source_has_no_patch_call(self) -> None:
         text = (SCRIPTS / "reset_traffic_migration.py").read_text(encoding="utf-8")
         self.assertIsNone(re.search(r'request\(\s*[\'"]PATCH[\'"]', text))
         self.assertIsNone(re.search(r'method\s*=\s*[\'"]PATCH[\'"]', text))
         self.assertIn("PATCH must not be used", text)
         self.assertIn("/actions/reset-traffic", text)
+        self.assertIn("fcntl.flock", text)
+        self.assertIn("LOCK_NB", text)
 
     def test_reconcile_still_never_resets(self) -> None:
         text = (SCRIPTS / "reconcile_traffic_limits.py").read_text(encoding="utf-8")
@@ -597,6 +662,7 @@ class ResetMigrationTests(DisableEnvProxiesMixin, unittest.TestCase):
             apply=False,
             confirm=None,
             apply_usernames=(),
+            lock_file=os.path.join(self.tmp.name, "apply.lock"),
             http_timeout=5,
             verify_retry_attempts=5,
             verify_retry_delay_sec=0,
@@ -1027,6 +1093,232 @@ class ResetMigrationTests(DisableEnvProxiesMixin, unittest.TestCase):
         self.assertEqual(summary["eligible_for_reset"], 0)
         self.assertEqual(summary["potential_disabled"], 1)
         self.assertEqual(summary["disabled_found"]["count"], 1)
+
+    def test_dry_run_does_not_require_apply_lock(self) -> None:
+        self._add_catalog()
+        self._add_user_service(1)
+        self._add_user(1)
+        lock_path = os.path.join(self.tmp.name, "held.lock")
+        holder = _hold_lock_subprocess(lock_path)
+        self.addCleanup(holder.stop)
+        out = os.path.join(self.tmp.name, "dry-while-held")
+        code, logs = self._run(self._cfg(out, lock_file=lock_path))
+        self.assertEqual(code, 0)
+        self.assertEqual(STATE.resets, [])
+        self.assertIn("0 reset-traffic", logs)
+        summary = self._load_summary(out)
+        self.assertFalse(summary["apply_lock_acquired"])
+        self.assertIsNone(summary["apply_lock_path"])
+
+    def test_apply_acquires_lock_and_writes_metadata(self) -> None:
+        self._add_catalog()
+        self._add_user_service(1)
+        self._add_user(1)
+        lock_path = os.path.join(self.tmp.name, "apply.lock")
+        out = os.path.join(self.tmp.name, "locked-apply")
+        code, logs = self._run(
+            self._cfg(out, apply=True, confirm=rst.CONFIRM_PHRASE, lock_file=lock_path)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(STATE.resets), 1)
+        self.assertIn("Apply lock acquired", logs)
+        summary = self._load_summary(out)
+        self.assertTrue(summary["apply_lock_acquired"])
+        self.assertEqual(os.path.abspath(summary["apply_lock_path"]), os.path.abspath(lock_path))
+        meta = json.loads(Path(lock_path).read_text(encoding="utf-8"))
+        self.assertEqual(meta["migration_cutoff"], CUTOFF_RAW)
+        self.assertEqual(meta["service_ids"], ["3"])
+        self.assertNotIn(SHM_PASSWORD, json.dumps(meta))
+        self.assertNotIn(RW_TOKEN, json.dumps(meta))
+        self.assertNotIn("super-secret", Path(lock_path).read_text(encoding="utf-8"))
+
+    def test_concurrent_apply_refused_zero_resets(self) -> None:
+        self._add_catalog()
+        self._add_user_service(1)
+        self._add_user(1)
+        lock_path = os.path.join(self.tmp.name, "shared.lock")
+        holder = _hold_lock_subprocess(lock_path)
+        self.addCleanup(holder.stop)
+        out = os.path.join(self.tmp.name, "blocked-apply")
+        code, logs = self._run(
+            self._cfg(out, apply=True, confirm=rst.CONFIRM_PHRASE, lock_file=lock_path)
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(STATE.resets, [])
+        self.assertEqual(STATE.patches, [])
+        self.assertIn(rst.CONCURRENT_APPLY_MESSAGE, logs)
+        self.assertFalse(os.path.exists(os.path.join(out, "summary.json")))
+
+    def test_lock_released_after_apply_allows_next(self) -> None:
+        self._add_catalog()
+        self._add_user_service(1)
+        self._add_user(1)
+        lock_path = os.path.join(self.tmp.name, "reuse.lock")
+        first = os.path.join(self.tmp.name, "first-apply")
+        code, _ = self._run(
+            self._cfg(first, apply=True, confirm=rst.CONFIRM_PHRASE, lock_file=lock_path)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(STATE.resets), 1)
+        second = os.path.join(self.tmp.name, "second-apply")
+        code, logs = self._run(
+            self._cfg(second, apply=True, confirm=rst.CONFIRM_PHRASE, lock_file=lock_path)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(STATE.resets), 1)
+        self.assertNotIn(rst.CONCURRENT_APPLY_MESSAGE, logs)
+        self.assertEqual(self._load_plan(second)[0]["classification"], rst.CLASS_ALREADY_RESET)
+
+    def test_exception_inside_apply_releases_lock(self) -> None:
+        self._add_catalog()
+        self._add_user_service(1)
+        self._add_user(1)
+        lock_path = os.path.join(self.tmp.name, "exc.lock")
+        out = os.path.join(self.tmp.name, "exc-apply")
+        with mock.patch.object(rst, "apply_resets", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self._run(
+                    self._cfg(
+                        out,
+                        apply=True,
+                        confirm=rst.CONFIRM_PHRASE,
+                        lock_file=lock_path,
+                    )
+                )
+        self.assertEqual(STATE.resets, [])
+        retry = os.path.join(self.tmp.name, "after-exc")
+        code, logs = self._run(
+            self._cfg(retry, apply=True, confirm=rst.CONFIRM_PHRASE, lock_file=lock_path)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(STATE.resets), 1)
+        self.assertNotIn(rst.CONCURRENT_APPLY_MESSAGE, logs)
+
+    def test_stale_lock_file_without_held_flock_does_not_block(self) -> None:
+        self._add_catalog()
+        self._add_user_service(1)
+        self._add_user(1)
+        lock_path = os.path.join(self.tmp.name, "stale.lock")
+        Path(lock_path).write_text(
+            json.dumps(
+                {
+                    "pid": 999999,
+                    "started_at": "2020-01-01T00:00:00Z",
+                    "migration_cutoff": CUTOFF_RAW,
+                    "service_ids": ["3"],
+                    "categories": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        out = os.path.join(self.tmp.name, "stale-apply")
+        code, logs = self._run(
+            self._cfg(out, apply=True, confirm=rst.CONFIRM_PHRASE, lock_file=lock_path)
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(STATE.resets), 1)
+        self.assertNotIn(rst.CONCURRENT_APPLY_MESSAGE, logs)
+
+    def test_custom_lock_file_is_used(self) -> None:
+        self._add_catalog()
+        self._add_user_service(1)
+        self._add_user(1)
+        custom = os.path.join(self.tmp.name, "nested", "custom.lock")
+        out = os.path.join(self.tmp.name, "custom-lock-apply")
+        code, logs = self._run(
+            self._cfg(out, apply=True, confirm=rst.CONFIRM_PHRASE, lock_file=custom)
+        )
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(custom))
+        self.assertIn(os.path.abspath(custom), logs)
+
+    def test_incident_overlapping_apply_then_cutoff_retry(self) -> None:
+        self._add_catalog()
+        self._add_user_service(1)
+        self._add_user(1)
+        lock_path = os.path.join(self.tmp.name, "incident.lock")
+        holder = _hold_lock_subprocess(lock_path)
+        self.addCleanup(holder.stop)
+        blocked = os.path.join(self.tmp.name, "incident-b")
+        code, logs = self._run(
+            self._cfg(
+                blocked,
+                apply=True,
+                confirm=rst.CONFIRM_PHRASE,
+                lock_file=lock_path,
+                apply_usernames=("us_1",),
+            )
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(STATE.resets, [])
+        self.assertIn("Refusing concurrent apply", logs)
+        holder.stop()
+        STATE.users["us_1"]["lastTrafficResetAt"] = LAST_RESET_AFTER
+        retry = os.path.join(self.tmp.name, "incident-retry")
+        code, _ = self._run(
+            self._cfg(
+                retry,
+                apply=True,
+                confirm=rst.CONFIRM_PHRASE,
+                lock_file=lock_path,
+                apply_usernames=("us_1",),
+            )
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(STATE.resets, [])
+        self.assertEqual(self._load_plan(retry)[0]["classification"], rst.CLASS_ALREADY_RESET)
+
+
+class _HeldLock:
+    def __init__(self, proc: subprocess.Popen[bytes]) -> None:
+        self.proc = proc
+
+    def stop(self) -> None:
+        if self.proc.poll() is None:
+            if self.proc.stdin is not None:
+                try:
+                    self.proc.stdin.write(b"release\n")
+                    self.proc.stdin.close()
+                except BrokenPipeError:
+                    pass
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        for stream in (self.proc.stdout, self.proc.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def _hold_lock_subprocess(lock_path: str) -> _HeldLock:
+    script = (
+        "import fcntl, os, sys\n"
+        "path = sys.argv[1]\n"
+        "os.makedirs(os.path.dirname(path) or '.', exist_ok=True)\n"
+        "fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)\n"
+        "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "sys.stdout.write('LOCKED\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stdin.readline()\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script, lock_path],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert proc.stdout is not None
+    line = proc.stdout.readline()
+    if line.strip() != b"LOCKED":
+        stderr = proc.stderr.read().decode("utf-8", "replace") if proc.stderr else ""
+        proc.kill()
+        raise RuntimeError(f"lock holder failed: {line!r} {stderr}")
+    if proc.stdout is not None:
+        proc.stdout.close()
+    if proc.stderr is not None:
+        proc.stderr.close()
+    return _HeldLock(proc)
 
 
 if __name__ == "__main__":
