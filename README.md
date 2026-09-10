@@ -465,6 +465,148 @@ python3 scripts/reconcile_traffic_limits.py \
 Запустите dry-run ещё раз в **новый** пустой `--output`: записи
 `needs_*` должны перейти в `already_correct`.
 
+### One-time monthly traffic migration
+
+Отдельная утилита `scripts/reset_traffic_migration.py` сбрасывает
+**накопленный** `usedTrafficBytes` у уже существующих пользователей
+после перевода Standard на календарный месяц.
+
+`reconcile_traffic_limits.py` по-прежнему **только** PATCH-ает
+`trafficLimitBytes` / `trafficLimitStrategy` и **никогда** не вызывает
+`/actions/reset-traffic`. Этот reset-tool наоборот: **только**
+`POST /api/users/{id}/actions/reset-traffic` и **никогда** не PATCH-ает
+пользователя и не меняет настройки услуги SHM.
+
+Целевая Standard policy:
+
+- `traffic_limit_bytes` = `322122547200` (300 GiB)
+- `traffic_limit_strategy` = `MONTH`
+
+`MONTH` означает календарный месяц; дальнейший reset выполняет
+Remnawave по своему monthly schedule. `PROLONGATE` для `MONTH` больше
+не делает manual reset (см. таблицу выше).
+
+**Последовательность будущей live-миграции**
+
+Один и тот же `--migration-cutoff` используется на всех шагах.
+Reset **после** смены policy, не раньше.
+
+1. Сохранить один migration cutoff (ISO8601 UTC). Его задаёт
+   оператор; между canary / full / retry / postcheck cutoff
+   не менять.
+2. Изменить настройки Standard-услуг в SHM: `NO_RESET` → `MONTH`
+   (bytes без изменений, `322122547200`).
+3. Сверить существующих пользователей Remnawave:
+   `reconcile_traffic_limits.py` классифицирует `NO_RESET` → `MONTH`
+   как `needs_set_strategy` (или `needs_set_limit` /
+   `needs_set_limit_and_strategy`, если bytes тоже расходятся)
+   и PATCH-ает только traffic-поля, без reset счётчика.
+4. Однократно сбросить накопленный трафик у существующих
+   Remnawave пользователей (`ACTIVE` и `DISABLED`), созданных
+   **до** cutoff, через `reset_traffic_migration.py`.
+   `DISABLED` остаётся `DISABLED`. Пользователи, которых ещё нет
+   в Remnawave, пропускаются: поздний `CREATE` после cutoff уже
+   получит `MONTH` и свежий счётчик, а `createdAt >= cutoff`
+   защитит его от лишнего migration reset.
+5. Postcheck: `eligible_for_reset=0`, уже обработанные —
+   `already_reset_since_cutoff`.
+6. Дальнейшие ежемесячные reset выполняет scheduler Remnawave.
+7. `PROLONGATE` при `MONTH` только продлевает `expireAt` и
+   синхронизирует limit/strategy, без manual reset.
+
+Пока live SHM strategy = `NO_RESET`, reset-tool fail-closed:
+`eligible_for_reset = 0`, классификация `service_not_month`.
+Поле `potential_after_month_migration` только информационное и
+**никогда** не разрешает apply.
+
+**Migration cutoff**
+
+`--migration-cutoff` (ISO8601 UTC, например `2026-09-10T18:00:00Z`) —
+обязательный параметр и **identity** миграции. Его задаёт оператор;
+скрипт не подставляет текущее время, время старта или время отчёта.
+
+- `createdAt >= cutoff` → `created_after_cutoff` (счётчик и так свежий)
+- `lastTrafficResetAt >= cutoff` → `already_reset_since_cutoff`
+- повторный прогон с **тем же** cutoff идемпотентен: уже сброшенные
+  не получают второй reset и лишние 300 GiB
+
+**Не меняйте cutoff** между canary, full run, retry и postcheck.
+
+**1. Dry-run** (default, без reset)
+
+```bash
+export SHM_PASSWORD='...'
+export REMNAWAVE_TOKEN='...'
+
+python3 scripts/reset_traffic_migration.py \
+  --shm-base-url https://shm.example.com \
+  --shm-login admin \
+  --shm-password-env SHM_PASSWORD \
+  --remnawave-panel-url https://panel.example.com \
+  --remnawave-token-env REMNAWAVE_TOKEN \
+  --migration-cutoff 2026-09-10T18:00:00Z \
+  --service-id 3 \
+  --service-id 4 \
+  --service-id 5 \
+  --service-id 6 \
+  --service-id 10 \
+  --service-id 11 \
+  --service-id 13 \
+  --output ./reset-traffic-migration-dry-run
+```
+
+В `--output`: `summary.json`, `plan.json`, `plan.csv`, `errors.csv`,
+`blocked.csv`, `planned-strategy-impact.json`.
+
+Apply требует одновременно:
+
+- `--apply`
+- `--confirm RESET_MONTHLY_TRAFFIC_MIGRATION`
+- хотя бы один `--category` или `--service-id`
+- `--migration-cutoff`
+
+Unscoped apply и apply без cutoff запрещены.
+`--apply-username` (можно повторять) — дополнительная allow-list
+поверх scope, для canary. Она **не** заменяет `--service-id` /
+`--category`.
+
+Перед каждым reset tool заново читает live SHM service settings и
+live Remnawave user. Reset только если оба уже `322122547200` +
+`MONTH`, статус `ACTIVE` или `DISABLED`, `createdAt < cutoff` и reset
+с cutoff ещё не было.
+
+Migration reset включает существующих пользователей до cutoff:
+
+- `ACTIVE` — eligible
+- `DISABLED` — eligible: сбрасывается только накопленный счётчик,
+  статус должен остаться `DISABLED`
+- `LIMITED` / `EXPIRED` / неизвестный статус — не reset
+
+`DISABLED` входит в one-time reset, чтобы после перехода на `MONTH`
+он не дождался ближайшего calendar reset Remnawave со старым
+`usedTrafficBytes` и не получил лишний месячный объём. После
+`reset-traffic` `post_status` обязан совпасть с `pre_status`.
+Смена `DISABLED` → `ACTIVE` — критическая ошибка, apply
+останавливается. `LIMITED` этим tool не трогается.
+
+**Canary (не запускать, пока policy не переведена на MONTH)**
+
+```bash
+python3 scripts/reset_traffic_migration.py \
+  --shm-base-url https://shm.example.com \
+  --shm-login admin \
+  --shm-password-env SHM_PASSWORD \
+  --remnawave-panel-url https://panel.example.com \
+  --remnawave-token-env REMNAWAVE_TOKEN \
+  --migration-cutoff SAME_CUTOFF_AS_THE_REST_OF_THE_MIGRATION \
+  --service-id 3 \
+  --apply-username us_X \
+  --apply-username us_Y \
+  --output ./reset-traffic-migration-canary \
+  --apply \
+  --confirm RESET_MONTHLY_TRAFFIC_MIGRATION
+```
+
 ---
 
 ## 🧹 Опция sanitize_username
