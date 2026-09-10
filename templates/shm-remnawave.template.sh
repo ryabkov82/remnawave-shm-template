@@ -245,6 +245,26 @@ _reset_user_traffic()       { local user_id="$1"; _require_user_id "${user_id}";
 _disable_user()             { local user_id="$1"; _require_user_id "${user_id}"; _http_post "/api/users/${user_id}/actions/disable" --data '{}' >/dev/null; }
 _enable_user()              { local user_id="$1"; _require_user_id "${user_id}"; _http_post "/api/users/${user_id}/actions/enable" --data '{}' >/dev/null; }
 
+# Manual reset on PROLONGATE only when Remnawave will not schedule one.
+# DAY/WEEK/MONTH are reset by Remnawave; NO_RESET is not.
+_should_reset_traffic_on_prolongate() {
+  local strategy
+  strategy="$(_effective_traffic_limit_strategy)"
+  [[ "${strategy}" == "NO_RESET" ]]
+}
+
+_reset_traffic_on_prolongate_if_needed() {
+  local user_id="$1"
+  local strategy
+  strategy="$(_effective_traffic_limit_strategy)"
+  if _should_reset_traffic_on_prolongate; then
+    log "Traffic reset on PROLONGATE: enabled (strategy=${strategy})"
+    _reset_user_traffic "${user_id}"
+  else
+    log "Traffic reset on PROLONGATE: skipped (strategy=${strategy}; managed by Remnawave)"
+  fi
+}
+
 # Payloads
 _build_create_payload() {
   _validate_hwid_device_limit
@@ -384,10 +404,10 @@ case "${EVENT}" in
     ;;
 
   PROLONGATE)
-    log "Prolongate ${USERNAME_SANITIZED} + reset traffic"
+    log "Prolongate ${USERNAME_SANITIZED}"
     user_id="$(_user_id_by_username "${USERNAME_SANITIZED}")"
 
-    _reset_user_traffic "${user_id}"
+    _reset_traffic_on_prolongate_if_needed "${user_id}"
     _log_effective_limits
     payload="$(_build_update_payload "${user_id}")"
     _http_patch "/api/users" --data "${payload}" >/dev/null

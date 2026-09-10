@@ -71,7 +71,7 @@ remnawave:
 | `internal_squad_name`	| ⛔	| Internal Squad для пользователей этой услуги |
 | `external_squad_name` | ⛔ | Точное имя External Squad в Remnawave. UUID в SHM не хранится. Отсутствие параметра сохраняет прежнее поведение |
 | `traffic_limit_bytes` |	⛔ |	Лимит трафика в байтах. Если не задан — используется 0 (без ограничения) |
-| `traffic_limit_strategy` |	⛔ |	Стратегия сброса лимита трафика. Допустимые значения: NO_RESET, DAY, WEEK, MONTH |
+| `traffic_limit_strategy` |	⛔ |	Стратегия сброса лимита трафика. Допустимые значения: NO_RESET, DAY, WEEK, MONTH. Кто сбрасывает трафик — см. ниже |
 | `hwid_device_limit` |	⛔ |	Лимит устройств (HWID Device Limit). Три состояния: отсутствует/`null` — глобальный HWID limit Remnawave; `0` — лимит отключён индивидуально; `N > 0` — индивидуальный лимит `N` |
 
 `external_squad_name` отвечает только за бренд / Subpage Config.
@@ -186,6 +186,19 @@ python3 scripts/reconcile_external_squads.py \
 
 - `traffic_limit_bytes` = `0` (без ограничения трафика)
 - `traffic_limit_strategy` = `NO_RESET`
+
+Кто сбрасывает `usedTrafficBytes`:
+
+| SHM `traffic_limit_strategy` | Scheduler Remnawave | Manual reset на SHM `PROLONGATE` |
+|------------------------------|---------------------|----------------------------------|
+| `NO_RESET` | нет | да |
+| `DAY` | да | нет |
+| `WEEK` | да | нет |
+| `MONTH` | да (календарный месяц; reset выполняет Remnawave по своему monthly schedule) | нет |
+
+`NO_RESET` означает: Remnawave сам трафик не сбрасывает, поэтому шаблон сохраняет ручной reset на `PROLONGATE`. Это совпадает с биллинговым периодом услуги (`period` 1 / 3 / 6 / 12 месяцев), а не с календарным месяцем. Для 3/6/12-месячных услуг один `PROLONGATE` (и один reset) приходится на весь оплаченный срок.
+
+`MONTH` означает: reset выполняет Remnawave по календарному месяцу. `PROLONGATE` тогда только продлевает `expireAt` и синхронизирует limit/strategy, без `/actions/reset-traffic`. Иначе получился бы двойной сброс: 1-го числа и в дату продления услуги.
 
 `hwid_device_limit` — отдельная семантика, `null` и `0` здесь не одно и то же:
 
@@ -325,8 +338,13 @@ Username в Remnawave: `us_<user_service_id>` (не `user_id`).
 По умолчанию выполняется **dry-run** (без изменений в Remnawave).
 Трафик **не** сбрасывается: нет вызова `/actions/reset-traffic` и нет
 записи `usedTrafficBytes` / `lastTrafficResetAt` / `status`.
-`NO_RESET` для Standard корректен: календарный reset в Remnawave не нужен,
-сброс трафика выполняет SHM `PROLONGATE`.
+Смена `NO_RESET` → `MONTH` классифицируется как `needs_set_strategy`
+и PATCH-ает только traffic-поля, без reset счётчика.
+
+`NO_RESET` + reset на SHM `PROLONGATE` даёт один сброс на весь
+`period` услуги (1 / 3 / 6 / 12 месяцев), не ежемесячно. Для
+ежемесячного календарного лимита нужна стратегия `MONTH` в настройках
+услуги; это отдельно от reconciliation.
 
 **1. Dry-run**
 
@@ -508,7 +526,7 @@ sanitize_username: true
 | `CREATE` | Создание пользователя и загрузка JSON-конфига |
 | `ACTIVATE` | Активация пользователя |
 | `BLOCK` | Блокировка пользователя |
-| `PROLONGATE` | Сброс трафика + продление срока |
+| `PROLONGATE` | Продление срока; manual reset трафика только при `NO_RESET` |
 | `REMOVE` | Удаление пользователя |
 | `UPDATE` | Обновление JSON-конфига в SHM |
 
