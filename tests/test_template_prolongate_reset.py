@@ -112,6 +112,7 @@ def _render_full(
         "{{ server.settings.remnawave.token }}": "test-token",
         "{{ server.settings.remnawave.default_internal_squad_name }}": "Default-Squad",
         "{{ us.service.settings.remnawave.internal_squad_name }}": "",
+        "{{ toJson(us.service.settings.remnawave.internal_squad_pool_names) }}": "",
         "{{ us.service.settings.remnawave.external_squad_name }}": "",
         "{{ us.service.settings.remnawave.traffic_limit_bytes }}": traffic_limit_bytes,
         "{{ us.service.settings.remnawave.traffic_limit_strategy }}": traffic_limit_strategy,

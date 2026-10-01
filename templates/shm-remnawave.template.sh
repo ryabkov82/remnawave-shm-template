@@ -1,10 +1,12 @@
 #!/bin/bash
 #
-# Remnawave ↔ SHM template (v1.4)
-# Internal Squad определяется по имени:
-# 1) us.service.settings.remnawave.internal_squad_name
-# 2) fallback: server.settings.remnawave.default_internal_squad_name
-# UUID внутреннего сквада в SHM не хранится и всегда резолвится через API панели.
+# Remnawave ↔ SHM template (v1.5)
+# Internal Squad на CREATE (один GET /api/internal-squads, без кеша):
+# 1) us.service.settings.remnawave.internal_squad_name          — fixed
+# 2) us.service.settings.remnawave.internal_squad_pool_names    — least info.membersCount
+# 3) server.settings.remnawave.default_internal_squad_name      — fallback
+# ACTIVATE / PROLONGATE / BLOCK / REMOVE / UPDATE сквад не пересчитывают.
+# UUID внутреннего сквада в SHM не хранится.
 #
 # External Squad задаётся опционально через
 # us.service.settings.remnawave.external_squad_name.
@@ -35,6 +37,14 @@ DEFAULT_INTERNAL_SQUAD_NAME="{{ server.settings.remnawave.default_internal_squad
 
 # ---- us.service.settings.remnawave.* ----
 SERVICE_INTERNAL_SQUAD_NAME="{{ us.service.settings.remnawave.internal_squad_name }}"
+# Literal heredoc: ', ", $, backticks and \ from toJson() are not expanded.
+# __SHM_JSON__ shares the directive line so SHM PRE_CHOMP does not glue the
+# JSON onto the heredoc delimiter. Absent/null stays empty or the literal null.
+SERVICE_INTERNAL_SQUAD_POOL_JSON="$(cat <<'__SHM_INTERNAL_SQUAD_POOL_JSON__'
+__SHM_JSON__{{ toJson(us.service.settings.remnawave.internal_squad_pool_names) }}
+__SHM_INTERNAL_SQUAD_POOL_JSON__
+)"
+SERVICE_INTERNAL_SQUAD_POOL_JSON="${SERVICE_INTERNAL_SQUAD_POOL_JSON#__SHM_JSON__}"
 SERVICE_EXTERNAL_SQUAD_NAME="{{ us.service.settings.remnawave.external_squad_name }}"
 SERVICE_TRAFFIC_LIMIT_BYTES="{{ us.service.settings.remnawave.traffic_limit_bytes }}"
 SERVICE_TRAFFIC_LIMIT_STRATEGY="{{ us.service.settings.remnawave.traffic_limit_strategy }}"
@@ -49,6 +59,13 @@ SANITIZE_USERNAME="{{ server.settings.remnawave.sanitize_username }}"
 SANITIZE_USERNAME="${SANITIZE_USERNAME:-false}"
 STATUS_ACTIVE="ACTIVE"
 STATUS_DISABLED="DISABLED"
+
+# Filled by _select_internal_squad_for_create before _build_create_payload.
+SELECTED_INTERNAL_SQUAD_MODE=""
+SELECTED_INTERNAL_SQUAD_NAME=""
+SELECTED_INTERNAL_SQUAD_UUID=""
+SELECTED_INTERNAL_SQUAD_MEMBERS=""
+SELECTED_INTERNAL_SQUAD_LOAD=""
 
 log() { echo "[$(date +'%F %T')] $*"; }
 fail() { echo "ERROR: $*" >&2; exit 1; }
@@ -131,8 +148,166 @@ _effective_internal_squad_name() {
   elif [[ -n "${DEFAULT_INTERNAL_SQUAD_NAME:-}" && "${DEFAULT_INTERNAL_SQUAD_NAME}" != "null" ]]; then
     echo "${DEFAULT_INTERNAL_SQUAD_NAME}"
   else
-    fail "No internal squad configured: neither us.service.settings.remnawave.internal_squad_name nor server.settings.remnawave.default_internal_squad_name is set"
+    fail "No internal squad configured: neither us.service.settings.remnawave.internal_squad_name nor us.service.settings.remnawave.internal_squad_pool_names nor server.settings.remnawave.default_internal_squad_name is set"
   fi
+}
+
+# Prints trimmed pool JSON and returns 0 when a pool value is present.
+# Empty and JSON null mean the dynamic pool is not configured (not an error).
+_internal_squad_pool_raw() {
+  local raw="${SERVICE_INTERNAL_SQUAD_POOL_JSON:-}"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  if [[ -z "${raw}" || "${raw}" == "null" ]]; then
+    return 1
+  fi
+  printf '%s' "${raw}"
+}
+
+_log_selected_internal_squad() {
+  log "Internal squad selection mode: ${SELECTED_INTERNAL_SQUAD_MODE}"
+  if [[ "${SELECTED_INTERNAL_SQUAD_MODE}" == "least_members" ]]; then
+    log "Internal squad pool load: ${SELECTED_INTERNAL_SQUAD_LOAD}"
+  fi
+  if [[ -n "${SELECTED_INTERNAL_SQUAD_MEMBERS}" ]]; then
+    log "Selected internal squad: ${SELECTED_INTERNAL_SQUAD_NAME} (members=${SELECTED_INTERNAL_SQUAD_MEMBERS})"
+  else
+    log "Selected internal squad: ${SELECTED_INTERNAL_SQUAD_NAME}"
+  fi
+}
+
+_require_internal_squads_snapshot() {
+  local squads_json="$1"
+  [[ -n "${squads_json}" ]] || fail "Empty response from /api/internal-squads"
+  jq -e '.response.internalSquads | type == "array"' >/dev/null 2>&1 <<<"${squads_json}" \
+    || fail "Unexpected /api/internal-squads response"
+}
+
+_assign_named_internal_squad() {
+  local squads_json="$1"
+  local name="$2"
+  local result ok
+  result="$(jq -c --arg NAME "${name}" '
+    [ .response.internalSquads[] | select(.name == $NAME) ] as $hits
+    | if ($hits | length) == 0 then
+        {ok: false, missing: true}
+      elif ($hits[0].uuid | type) != "string" or $hits[0].uuid == "" then
+        {ok: false, missing: false, error: ("Internal Squad has no uuid: " + $NAME)}
+      else
+        {
+          ok: true,
+          name: $NAME,
+          uuid: $hits[0].uuid,
+          members: (
+            if ($hits[0].info.membersCount | type) == "number" then
+              $hits[0].info.membersCount
+            else
+              null
+            end
+          )
+        }
+      end
+  ' <<<"${squads_json}")" || fail "Failed to parse /api/internal-squads response"
+  ok="$(jq -r '.ok' <<<"${result}")"
+  if [[ "${ok}" != "true" ]]; then
+    if [[ "$(jq -r '.missing // false' <<<"${result}")" == "true" ]]; then
+      fail "Internal Squad '${name}' not found on panel ${PANEL_URL}"
+    fi
+    fail "$(jq -r '.error' <<<"${result}")"
+  fi
+  SELECTED_INTERNAL_SQUAD_NAME="$(jq -r '.name' <<<"${result}")"
+  SELECTED_INTERNAL_SQUAD_UUID="$(jq -r '.uuid' <<<"${result}")"
+  SELECTED_INTERNAL_SQUAD_MEMBERS="$(jq -r 'if .members == null then "" else (.members | tostring) end' <<<"${result}")"
+  SELECTED_INTERNAL_SQUAD_LOAD=""
+}
+
+_assign_least_members_internal_squad() {
+  local squads_json="$1"
+  local pool_json="$2"
+  local result ok
+  jq -e 'type' >/dev/null 2>&1 <<<"${pool_json}" \
+    || fail "Invalid internal_squad_pool_names: not valid JSON"
+  result="$(jq -c --argjson POOL "${pool_json}" '
+    def bad($msg): {ok: false, error: $msg};
+    if ($POOL | type) != "array" then
+      bad("Invalid internal_squad_pool_names: must be a JSON array of squad names")
+    elif ($POOL | length) == 0 then
+      bad("Invalid internal_squad_pool_names: empty array")
+    elif any($POOL[]; type != "string") then
+      bad("Invalid internal_squad_pool_names: every item must be a non-empty string")
+    elif any($POOL[]; length == 0) then
+      bad("Invalid internal_squad_pool_names: contains an empty string")
+    elif any($POOL[]; . != gsub("^[[:space:]]+|[[:space:]]+$"; "")) then
+      bad("Invalid internal_squad_pool_names: name has leading or trailing whitespace")
+    elif ($POOL | length) != ($POOL | unique | length) then
+      bad("Invalid internal_squad_pool_names: duplicate names")
+    else
+      .response.internalSquads as $squads
+      | [ $POOL[] as $name
+          | [ $squads[] | select(.name == $name) ] as $hits
+          | if ($hits | length) == 0 then
+              {missing: $name}
+            elif ($hits[0].uuid | type) != "string" or $hits[0].uuid == "" then
+              {bad_uuid: $name}
+            elif ($hits[0].info.membersCount | type) != "number" then
+              {bad_members: $name}
+            else
+              {name: $name, uuid: $hits[0].uuid, members: $hits[0].info.membersCount}
+            end
+        ] as $rows
+      | if any($rows[]; has("missing")) then
+          bad("Configured internal squad not found on panel: " + ([$rows[] | select(has("missing")) | .missing] | join(", ")))
+        elif any($rows[]; has("bad_uuid")) then
+          bad("Internal squad has no uuid: " + ([$rows[] | select(has("bad_uuid")) | .bad_uuid] | join(", ")))
+        elif any($rows[]; has("bad_members")) then
+          bad("Internal squad membersCount is not a number: " + ([$rows[] | select(has("bad_members")) | .bad_members] | join(", ")))
+        else
+          ($rows | sort_by(.members, .name) | .[0]) as $best
+          | {
+              ok: true,
+              name: $best.name,
+              uuid: $best.uuid,
+              members: $best.members,
+              load: ($rows | map("\(.name)=\(.members)") | join(", "))
+            }
+        end
+    end
+  ' <<<"${squads_json}")" || fail "Failed to evaluate internal squad pool"
+  ok="$(jq -r '.ok' <<<"${result}")"
+  if [[ "${ok}" != "true" ]]; then
+    local err
+    err="$(jq -r '.error // "internal squad pool selection failed"' <<<"${result}")"
+    case "${err}" in
+      "Configured internal squad not found on panel:"*)
+        fail "${err} (${PANEL_URL})"
+        ;;
+    esac
+    fail "${err}"
+  fi
+  SELECTED_INTERNAL_SQUAD_NAME="$(jq -r '.name' <<<"${result}")"
+  SELECTED_INTERNAL_SQUAD_UUID="$(jq -r '.uuid' <<<"${result}")"
+  SELECTED_INTERNAL_SQUAD_MEMBERS="$(jq -r '.members | tostring' <<<"${result}")"
+  SELECTED_INTERNAL_SQUAD_LOAD="$(jq -r '.load' <<<"${result}")"
+}
+
+# One snapshot per CREATE. Sets SELECTED_INTERNAL_SQUAD_* for _build_create_payload.
+_select_internal_squad_for_create() {
+  local squads_json pool_json fallback_name
+  squads_json="$(_http_get "/api/internal-squads")"
+  _require_internal_squads_snapshot "${squads_json}"
+
+  if [[ -n "${SERVICE_INTERNAL_SQUAD_NAME:-}" && "${SERVICE_INTERNAL_SQUAD_NAME}" != "null" ]]; then
+    SELECTED_INTERNAL_SQUAD_MODE="fixed"
+    _assign_named_internal_squad "${squads_json}" "${SERVICE_INTERNAL_SQUAD_NAME}"
+  elif pool_json="$(_internal_squad_pool_raw)"; then
+    SELECTED_INTERNAL_SQUAD_MODE="least_members"
+    _assign_least_members_internal_squad "${squads_json}" "${pool_json}"
+  else
+    fallback_name="$(_effective_internal_squad_name)"
+    SELECTED_INTERNAL_SQUAD_MODE="fallback"
+    _assign_named_internal_squad "${squads_json}" "${fallback_name}"
+  fi
+  _log_selected_internal_squad
 }
 
 _effective_external_squad_name() {
@@ -205,7 +380,8 @@ _log_effective_limits() {
   log "Effective HWID device limit: $(_hwid_device_limit_log_label)"
 }
 
-# Всегда резолвим UUID внутреннего сквада по ИМЕНИ (без кеша)
+# Резолв UUID по имени отдельным GET. CREATE его не вызывает:
+# UUID уже выбран из snapshot в _select_internal_squad_for_create.
 _resolve_internal_squad_uuid_by_name() {
   local squad_name="$1"
   [[ -n "${squad_name:-}" ]] || fail "internal squad name is empty"
@@ -269,8 +445,8 @@ _reset_traffic_on_prolongate_if_needed() {
 _build_create_payload() {
   _validate_hwid_device_limit
   local expire_iso="$(_expire_iso)"
-  local squad_name="$(_effective_internal_squad_name)"
-  local squad_uuid="$(_resolve_internal_squad_uuid_by_name "${squad_name}")"
+  local squad_uuid="${SELECTED_INTERNAL_SQUAD_UUID:-}"
+  [[ -n "${squad_uuid}" ]] || fail "Internal squad UUID is not selected"
   local traffic_limit_bytes="$(_effective_traffic_limit_bytes)"
   local traffic_limit_strategy="$(_effective_traffic_limit_strategy)"
   local hwid_device_limit
@@ -336,7 +512,7 @@ ${hwid_update_line}
 JSON
 }
 
-log "Remnawave Template v1.4"
+log "Remnawave Template v1.5"
 log "EVENT=${EVENT}"
 
 case "${EVENT}" in
@@ -349,7 +525,7 @@ case "${EVENT}" in
 
   CREATE)
     log "Create user ${USERNAME}"
-    log "Effective internal squad: $(_effective_internal_squad_name)"
+    _select_internal_squad_for_create
     log "Effective external squad: $(_effective_external_squad_name)"
     _log_effective_limits
     payload="$(_build_create_payload)"

@@ -11,7 +11,7 @@
 - Автоматическое управление пользователями Remnawave:
   - создание, активация, блокировка, продление, удаление;
 - Привязка к **Internal Squad** (через имя, без кэша UUID);
-- **🆕 Поддержка выбора Internal Squad на уровне услуги SHM (с fallback на серверный Squad)**;
+- Выбор Internal Squad на `CREATE`: fixed name, least-members pool или server fallback;
 - **🆕 Поддержка лимита трафика на уровне услуги SHM**;
 - **🆕 Поддержка стратегии сброса трафика на уровне услуги SHM**;
 - **🆕 Поддержка лимита устройств (HWID Device Limit) на уровне услуги SHM**;
@@ -31,7 +31,7 @@
 remnawave:
   api: https://panel.example.com           # Базовый URL панели Remnawave (https://...)
   token: eyJh...                           # API-токен (Bearer)
-  default_internal_squad_name: Default-Squad  # Fallback Internal Squad (если не задан в услуге)
+  default_internal_squad_name: Default-Squad  # Fallback, если у услуги нет fixed squad и нет pool
 
   # Необязательные параметры:
   shm_tz: Europe/Moscow          # Таймзона SHM, если отличается от системной
@@ -45,7 +45,7 @@ remnawave:
 |-----------|--------------|-----------|
 | `api` | ✅ | Базовый URL API панели (например https://panel.example.com) |
 | `token` | ✅ | Bearer-токен администратора Remnawave |
-| `default_internal_squad_name` | ✅ | Internal Squad по умолчанию (если не задан в услуге) |
+| `default_internal_squad_name` | ✅ | Server fallback Internal Squad. Используется, только если у услуги не заданы ни `internal_squad_name`, ни `internal_squad_pool_names` |
 | `shm_tz` | ⛔ | Таймзона SHM для корректной конвертации времени (пример: Europe/Moscow) |
 | `expire_safety_minutes` | ⛔ | Дополнительный сдвиг срока действия в минутах |
 | `sanitize_username` | ⛔ | Если true,username приводится алгоритмом из remnawave/subscription-page |
@@ -54,7 +54,9 @@ remnawave:
 
 ## 🧩 Настройки услуги (опционально)
 
-Для конкретной услуги в SHM можно задать собственный Internal Squad и опционально External Squad:
+Для конкретной услуги в SHM можно задать Internal Squad и опционально External Squad.
+
+Fixed squad (pool при этом не используется):
 
 ```yaml
 remnawave:
@@ -62,20 +64,34 @@ remnawave:
   external_squad_name: VPN-for-Friends
   traffic_limit_bytes: 53687091200
   traffic_limit_strategy: MONTH
-  hwid_device_limit: 2  
+  hwid_device_limit: 2
+```
+
+Dynamic pool — только если `internal_squad_name` не задан. На `CREATE` выбирается сквад с минимальным `info.membersCount`:
+
+```yaml
+remnawave:
+  internal_squad_pool_names:
+    - Default-Squad
+    - VFF-STD-S01
+    - VFF-STD-S02
+    - VFF-STD-S03
+    - VFF-STD-S04
+    - VFF-STD-S05
 ```
 
 ### 🔍 Описание параметров услуги
 | Параметр | Обязательный | Описание |
 |-----------|--------------|-----------|
-| `internal_squad_name`	| ⛔	| Internal Squad для пользователей этой услуги |
+| `internal_squad_name` | ⛔ | Fixed Internal Squad. Если задан и не `null`, новый пользователь всегда создаётся в этом скваде. Имеет приоритет над pool |
+| `internal_squad_pool_names` | ⛔ | Массив точных имён Internal Squad. На `CREATE`, если fixed name не задан, выбирается сквад с минимальным `info.membersCount`. Пустое значение или `null` — pool не используется |
 | `external_squad_name` | ⛔ | Точное имя External Squad в Remnawave. UUID в SHM не хранится. Отсутствие параметра сохраняет прежнее поведение |
 | `traffic_limit_bytes` |	⛔ |	Лимит трафика в байтах. Если не задан — используется 0 (без ограничения) |
 | `traffic_limit_strategy` |	⛔ |	Стратегия сброса лимита трафика. Допустимые значения: NO_RESET, DAY, WEEK, MONTH. Кто сбрасывает трафик — см. ниже |
 | `hwid_device_limit` |	⛔ |	Лимит устройств (HWID Device Limit). Три состояния: отсутствует/`null` — глобальный HWID limit Remnawave; `0` — лимит отключён индивидуально; `N > 0` — индивидуальный лимит `N` |
 
 `external_squad_name` отвечает только за бренд / Subpage Config.
-`internal_squad_name` по-прежнему определяет доступные ноды и inbound.
+Доступные ноды и inbound определяет выбранный Internal Squad: fixed `internal_squad_name` либо один сквад из `internal_squad_pool_names`.
 
 Примеры настройки только External Squad (остальные параметры услуги без изменений):
 
@@ -93,12 +109,17 @@ remnawave:
 
 ### Приоритет выбора Internal Squad
 
-Шаблон определяет Internal Squad в следующем порядке:
+Шаблон выбирает Internal Squad **только на событии `CREATE`**, одним запросом `GET /api/internal-squads` (без кеша и без второго запроса ради UUID):
 
-1. `us.service.settings.remnawave.internal_squad_name`
-2. `server.settings.remnawave.default_internal_squad_name`
+1. `us.service.settings.remnawave.internal_squad_name` — fixed override. Непустое значение, отличное от `null`, всегда побеждает.
+2. `us.service.settings.remnawave.internal_squad_pool_names` — dynamic pool. Непустой массив точных имён: выбирается сквад с минимальным `info.membersCount`. При равенстве — имя по возрастанию. Учитываются только имена из массива. Если хотя бы одного имени нет в ответе панели, `CREATE` завершается ошибкой.
+3. `server.settings.remnawave.default_internal_squad_name` — server fallback, если не заданы ни fixed name, ни pool.
 
-Это позволяет использовать один и тот же шаблон для нескольких тарифов и направлять пользователей в разные Internal Squad Remnawave.
+`ACTIVATE`, `PROLONGATE`, `BLOCK`, `REMOVE` и `UPDATE` не пересчитывают и не меняют Internal Squad. Уже созданные пользователи этим шаблоном не мигрируют.
+
+Массив pool читается через SHM `toJson()` и разбирается как JSON. Отсутствие настройки и `null` означают, что dynamic pool нет. Пустой массив, не-массив, пустая строка, дубликат имени или нечисловой `membersCount` — ошибка `CREATE`, а не тихий fallback на оставшиеся сквады.
+
+Например, при `Default-Squad=222`, `VFF-STD-S01=210`, `VFF-STD-S02=203`, `VFF-STD-S03=290`, `VFF-STD-S04=289`, `VFF-STD-S05=242` новый пользователь попадёт в `VFF-STD-S02`. Услуга с `internal_squad_name: AntiBlock-Squad` всегда создаёт пользователя в `AntiBlock-Squad`, даже если pool задан рядом.
 
 Для External Squad серверного fallback нет: параметр задаётся только на уровне услуги. Отсутствие или `null` означает, что External Squad не задан.
 

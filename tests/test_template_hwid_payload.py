@@ -39,6 +39,7 @@ def _render(
         "{{ server.settings.remnawave.token }}": "test-token",
         "{{ server.settings.remnawave.default_internal_squad_name }}": "Default-Squad",
         "{{ us.service.settings.remnawave.internal_squad_name }}": "",
+        "{{ toJson(us.service.settings.remnawave.internal_squad_pool_names) }}": "",
         "{{ us.service.settings.remnawave.external_squad_name }}": external_squad_name,
         "{{ us.service.settings.remnawave.traffic_limit_bytes }}": traffic_limit_bytes,
         "{{ us.service.settings.remnawave.traffic_limit_strategy }}": traffic_limit_strategy,
@@ -86,6 +87,7 @@ def _run_payload(
         hwid=hwid, omit_hwid_placeholder=omit_hwid_placeholder, **kwargs
     )
     driver = r"""
+SELECTED_INTERNAL_SQUAD_UUID='%s'
 _resolve_internal_squad_uuid_by_name() { echo '%s'; }
 _resolve_external_squad_uuid_by_name() { echo '%s'; }
 if [[ "${PAYLOAD_MODE}" == "create" ]]; then
@@ -99,6 +101,7 @@ else
   exit 2
 fi
 """ % (
+        INTERNAL_UUID,
         INTERNAL_UUID,
         VFF_UUID,
     )
