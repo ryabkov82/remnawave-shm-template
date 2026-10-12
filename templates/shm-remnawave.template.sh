@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Remnawave ↔ SHM template (v1.5)
+# Remnawave ↔ SHM template (v1.6)
 # Internal Squad на CREATE (один GET /api/internal-squads, без кеша):
 # 1) us.service.settings.remnawave.internal_squad_name          — fixed
 # 2) us.service.settings.remnawave.internal_squad_pool_names    — least info.membersCount
@@ -45,6 +45,25 @@ __SHM_JSON__{{ toJson(us.service.settings.remnawave.internal_squad_pool_names) }
 __SHM_INTERNAL_SQUAD_POOL_JSON__
 )"
 SERVICE_INTERNAL_SQUAD_POOL_JSON="${SERVICE_INTERNAL_SQUAD_POOL_JSON#__SHM_JSON__}"
+# Untrusted profile fields. SHM substitutes these before bash starts, so a raw
+# value in this file would be shell source. toJson() + a quoted heredoc keeps
+# backticks, dollars, backslashes, quotes and newlines as one JSON string.
+# jq decodes that data when the CREATE payload is built.
+USER_LOGIN_JSON="$(cat <<'__SHM_USER_LOGIN_JSON__'
+__SHM_JSON__{{ toJson(user.login) }}
+__SHM_USER_LOGIN_JSON__
+)"
+USER_LOGIN_JSON="${USER_LOGIN_JSON#__SHM_JSON__}"
+USER_FULL_NAME_JSON="$(cat <<'__SHM_USER_FULL_NAME_JSON__'
+__SHM_JSON__{{ toJson(user.full_name) }}
+__SHM_USER_FULL_NAME_JSON__
+)"
+USER_FULL_NAME_JSON="${USER_FULL_NAME_JSON#__SHM_JSON__}"
+USER_TELEGRAM_LOGIN_JSON="$(cat <<'__SHM_USER_TELEGRAM_LOGIN_JSON__'
+__SHM_JSON__{{ toJson(user.settings.telegram.login) }}
+__SHM_USER_TELEGRAM_LOGIN_JSON__
+)"
+USER_TELEGRAM_LOGIN_JSON="${USER_TELEGRAM_LOGIN_JSON#__SHM_JSON__}"
 SERVICE_EXTERNAL_SQUAD_NAME="{{ us.service.settings.remnawave.external_squad_name }}"
 SERVICE_TRAFFIC_LIMIT_BYTES="{{ us.service.settings.remnawave.traffic_limit_bytes }}"
 SERVICE_TRAFFIC_LIMIT_STRATEGY="{{ us.service.settings.remnawave.traffic_limit_strategy }}"
@@ -441,6 +460,22 @@ _reset_traffic_on_prolongate_if_needed() {
   fi
 }
 
+# Empty text and JSON null become "". A JSON string is returned unchanged.
+# Call as: value="$(_json_string_or_empty "$raw")" || fail "..."
+# so a rejected value exits the current shell (fail inside $(...) would not).
+_json_string_or_empty() {
+  local raw="$1"
+  local trimmed
+  trimmed="${raw#"${raw%%[![:space:]]*}"}"
+  trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+  if [[ -z "${trimmed}" || "${trimmed}" == "null" ]]; then
+    printf '%s' '""'
+    return 0
+  fi
+  jq -e -n --argjson value "${trimmed}" '$value | type == "string"' >/dev/null || return 1
+  printf '%s' "${trimmed}"
+}
+
 # Payloads
 _build_create_payload() {
   _validate_hwid_device_limit
@@ -451,36 +486,46 @@ _build_create_payload() {
   local traffic_limit_strategy="$(_effective_traffic_limit_strategy)"
   local hwid_device_limit
   hwid_device_limit="$(_effective_hwid_device_limit)"
-  local hwid_create_line=""
   local external_squad_name="$(_effective_external_squad_name)"
-  local external_squad_uuid_json="null"
-
-  if [[ -n "${hwid_device_limit}" ]]; then
-    hwid_create_line="  \"hwidDeviceLimit\": ${hwid_device_limit},"
-  fi
+  local external_squad_uuid=""
+  local login_json name_json telegram_json
 
   if [[ -n "${external_squad_name}" ]]; then
-    local external_squad_uuid
     external_squad_uuid="$(_resolve_external_squad_uuid_by_name "${external_squad_name}")"
-    external_squad_uuid_json="\"${external_squad_uuid}\""
   fi
 
-  cat <<JSON
-{
-  "username": "${USERNAME}",
-  "status": "${STATUS_ACTIVE}",
-  "trafficLimitBytes": ${traffic_limit_bytes},
-  "trafficLimitStrategy": "${traffic_limit_strategy}",
-  "expireAt": "${expire_iso}",
-  "description": "SHM: login={{ user.login }}, name={{ user.full_name }}, url=https://t.me/{{ user.settings.telegram.login }}",
-  "tag": null,
-  "telegramId": null,
-  "email": null,
-${hwid_create_line}
-  "activeInternalSquads": ["${squad_uuid}"],
-  "externalSquadUuid": ${external_squad_uuid_json}
-}
-JSON
+  login_json="$(_json_string_or_empty "${USER_LOGIN_JSON}")" || fail "user.login must be a JSON string"
+  name_json="$(_json_string_or_empty "${USER_FULL_NAME_JSON}")" || fail "user.full_name must be a JSON string"
+  telegram_json="$(_json_string_or_empty "${USER_TELEGRAM_LOGIN_JSON}")" || fail "user.settings.telegram.login must be a JSON string"
+
+  jq -n \
+    --arg username "${USERNAME}" \
+    --arg status "${STATUS_ACTIVE}" \
+    --argjson trafficLimitBytes "${traffic_limit_bytes}" \
+    --arg trafficLimitStrategy "${traffic_limit_strategy}" \
+    --arg expireAt "${expire_iso}" \
+    --argjson login "${login_json}" \
+    --argjson fullName "${name_json}" \
+    --argjson telegramLogin "${telegram_json}" \
+    --arg squadUuid "${squad_uuid}" \
+    --arg externalSquadUuid "${external_squad_uuid}" \
+    --arg hwidDeviceLimit "${hwid_device_limit}" \
+    '{
+      username: $username,
+      status: $status,
+      trafficLimitBytes: $trafficLimitBytes,
+      trafficLimitStrategy: $trafficLimitStrategy,
+      expireAt: $expireAt,
+      description: ("SHM: login=" + $login + ", name=" + $fullName + ", url=https://t.me/" + $telegramLogin),
+      tag: null,
+      telegramId: null,
+      email: null
+    }
+    + (if $hwidDeviceLimit == "" then {} else {hwidDeviceLimit: ($hwidDeviceLimit | tonumber)} end)
+    + {
+        activeInternalSquads: [$squadUuid],
+        externalSquadUuid: (if $externalSquadUuid == "" then null else $externalSquadUuid end)
+      }'
 }
 
 _build_update_payload() {
@@ -512,7 +557,7 @@ ${hwid_update_line}
 JSON
 }
 
-log "Remnawave Template v1.5"
+log "Remnawave Template v1.6"
 log "EVENT=${EVENT}"
 
 case "${EVENT}" in

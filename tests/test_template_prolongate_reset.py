@@ -122,9 +122,9 @@ def _render_full(
         "{{ us.id }}": "42",
         "{{ server.settings.remnawave.sanitize_username }}": "false",
         "{{ us.expire }}": expire,
-        "{{ user.login }}": "alice",
-        "{{ user.full_name }}": "Alice Example",
-        "{{ user.settings.telegram.login }}": "alice_tg",
+        "{{ toJson(user.login) }}": json.dumps("alice"),
+        "{{ toJson(user.full_name) }}": json.dumps("Alice Example"),
+        "{{ toJson(user.settings.telegram.login) }}": json.dumps("alice_tg"),
     }
     for needle, value in replacements.items():
         text = text.replace(needle, value)
