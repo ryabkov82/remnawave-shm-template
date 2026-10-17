@@ -23,6 +23,11 @@
 # Lifecycle UPDATE never sends JSON null: it cannot reset an existing explicit
 # Remnawave value back to panel default. That reset is reconciliation-only.
 #
+# REMOVE is idempotent. GET /api/users/by-username HTTP 404 means the panel
+# user is already gone, so the event succeeds. Transport errors, HTTP 5xx,
+# any other status, and HTTP 200 without a numeric response.id stay fatal.
+# ACTIVATE / BLOCK / PROLONGATE keep the strict _user_id_by_username lookup.
+#
 set -euo pipefail
 
 # ---- SHM placeholders ----
@@ -150,6 +155,49 @@ _user_id_by_username() {
   user_id="$(_http_get "/api/users/by-username/${username}" | jq -r '.response.id // empty')"
   [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "User not found: ${username}"
   echo "${user_id}"
+}
+
+# REMOVE-only lookup. Does not weaken _user_id_by_username.
+# Returns 0 and sets REMNAWAVE_REMOVE_USER_ID when response.id is a numeric id.
+# Returns 2 only for an exact HTTP 404 from a completed curl transfer.
+# curl/network failure is fatal even if the write-out status looks like 404.
+# HTTP 5xx, other statuses, malformed JSON, and HTTP 200 without response.id
+# are fatal. The response body is not used to decide that a user is absent.
+_lookup_user_id_for_remove() {
+  local username="$1"
+  local body_file http_code curl_rc user_id jq_rc
+  REMNAWAVE_REMOVE_USER_ID=""
+  body_file="$(mktemp)" || fail "User lookup failed for ${username}: mktemp failed"
+
+  http_code="$(
+    curl -skS -o "${body_file}" -w "%{http_code}" \
+      -H "$(_auth_header)" \
+      "${PANEL_URL}/api/users/by-username/${username}"
+  )" && curl_rc=0 || curl_rc=$?
+
+  if [[ "${curl_rc}" -ne 0 ]]; then
+    rm -f "${body_file}"
+    fail "User lookup failed for ${username}: curl exit ${curl_rc}"
+  fi
+
+  if [[ "${http_code}" == "404" ]]; then
+    rm -f "${body_file}"
+    return 2
+  fi
+
+  if [[ "${http_code}" != "200" ]]; then
+    rm -f "${body_file}"
+    fail "User lookup failed for ${username}: HTTP ${http_code}"
+  fi
+
+  user_id="$(jq -r '.response.id // empty' "${body_file}")" && jq_rc=0 || jq_rc=$?
+  rm -f "${body_file}"
+  if [[ "${jq_rc}" -ne 0 ]]; then
+    fail "User lookup for ${username} returned HTTP 200 with malformed JSON"
+  fi
+  [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "User lookup for ${username} returned HTTP 200 without a valid user id"
+  REMNAWAVE_REMOVE_USER_ID="${user_id}"
+  return 0
 }
 
 _subscription_json_by_username() {
@@ -614,10 +662,21 @@ case "${EVENT}" in
 
   REMOVE)
     log "Remove ${USERNAME_SANITIZED}"
-    user_id="$(_user_id_by_username "${USERNAME_SANITIZED}")"
-
-    _revoke_user_subscription "${user_id}"
-    _delete_user "${user_id}"
+    # Direct call, not $(...): fail/exit must abort this script, not a subshell.
+    # set +e only around the call so return 2 (HTTP 404) can be classified.
+    # curl_rc is checked before http_code, so a failed transfer cannot be 404.
+    set +e
+    _lookup_user_id_for_remove "${USERNAME_SANITIZED}"
+    lookup_rc=$?
+    set -e
+    if [[ "${lookup_rc}" -eq 0 ]]; then
+      _revoke_user_subscription "${REMNAWAVE_REMOVE_USER_ID}"
+      _delete_user "${REMNAWAVE_REMOVE_USER_ID}"
+    elif [[ "${lookup_rc}" -eq 2 ]]; then
+      log "User ${USERNAME_SANITIZED} already absent; REMOVE is already satisfied"
+    else
+      fail "User lookup failed for ${USERNAME_SANITIZED}"
+    fi
 
     log "Delete SHM key vpn_mrzb_{{ us.id }}"
     curl -skS -X DELETE -H "session-id: ${SESSION_ID}" "${API_URL}/shm/v1/storage/manage/vpn_mrzb_{{ us.id }}" >/dev/null || true

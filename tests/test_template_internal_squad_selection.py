@@ -135,6 +135,20 @@ _http_delete() {
 
 curl() {
   echo "CURL $*" >> "${CALL_LOG}"
+  # REMOVE captures HTTP status with curl -o/-w. Keep a present user as 200.
+  local outfile=""
+  local prev=""
+  local arg
+  for arg in "$@"; do
+    if [[ "${prev}" == "-o" ]]; then
+      outfile="${arg}"
+    fi
+    prev="${arg}"
+  done
+  local url="${@: -1}"
+  if [[ "${url}" == *"/api/users/by-username/"* && -n "${outfile}" && "${outfile}" != "/dev/null" ]]; then
+    printf '%s' '{"response":{"id":77}}' > "${outfile}"
+  fi
   echo 200
 }
 """
