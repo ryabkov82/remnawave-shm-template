@@ -135,21 +135,50 @@ _http_delete() {
 
 curl() {
   echo "CURL $*" >> "${CALL_LOG}"
-  # REMOVE captures HTTP status with curl -o/-w. Keep a present user as 200.
+  # CREATE captures HTTP status with curl -o/-w and POSTs the user itself.
+  # HTTP 404 on CREATE means the panel user is absent, so the script goes on
+  # to POST. REMOVE still sees a present user: HTTP 200 and a numeric id.
   local outfile=""
+  local data=""
+  local method=""
   local prev=""
   local arg
   for arg in "$@"; do
     if [[ "${prev}" == "-o" ]]; then
       outfile="${arg}"
+    elif [[ "${prev}" == "--data" || "${prev}" == "--data-binary" ]]; then
+      data="${arg}"
+    elif [[ "${prev}" == "-X" ]]; then
+      method="${arg}"
     fi
     prev="${arg}"
   done
   local url="${@: -1}"
+  if [[ "${method}" == "POST" && "${url}" == */api/users ]]; then
+    echo "POST /api/users" >> "${CALL_LOG}"
+    if [[ -n "${CREATE_BODY:-}" ]]; then
+      printf '%s' "${data}" > "${CREATE_BODY}"
+    fi
+    if [[ -n "${outfile}" && "${outfile}" != "/dev/null" ]]; then
+      printf '%s' "{\"response\":{\"id\":77,\"username\":\"${USERNAME}\",\"shortUuid\":\"mock-short\"}}" > "${outfile}"
+    fi
+    printf '%s' '201'
+    return 0
+  fi
+  if [[ "${url}" == *"/api/subscriptions/by-username/"* && -n "${outfile}" && "${outfile}" != "/dev/null" ]]; then
+    printf '%s' "{\"response\":{\"subscriptionUrl\":\"https://sub.test/x\",\"user\":{\"username\":\"${USERNAME}\",\"shortUuid\":\"mock-short\"}}}" > "${outfile}"
+    printf '%s' '200'
+    return 0
+  fi
   if [[ "${url}" == *"/api/users/by-username/"* && -n "${outfile}" && "${outfile}" != "/dev/null" ]]; then
+    if [[ "${EVENT}" == "CREATE" ]]; then
+      printf '%s' '{"message":"User with specified params not found","errorCode":"A063"}' > "${outfile}"
+      printf '%s' '404'
+      return 0
+    fi
     printf '%s' '{"response":{"id":77}}' > "${outfile}"
   fi
-  echo 200
+  printf '%s' '200'
 }
 """
 
@@ -616,7 +645,7 @@ class InternalSquadSelectionSourceTests(unittest.TestCase):
         ]
         calls = [line for line in mentions if line not in definitions]
         self.assertEqual(len(definitions), 1)
-        self.assertEqual(calls, ["    _select_internal_squad_for_create"])
+        self.assertEqual(calls, ["      _select_internal_squad_for_create"])
         create = text.split("CREATE)", 1)[1].split("ACTIVATE)", 1)[0]
         self.assertIn("_select_internal_squad_for_create", create)
         for event, end in (

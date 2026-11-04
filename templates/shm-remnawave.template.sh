@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Remnawave ↔ SHM template (v1.6)
+# Remnawave ↔ SHM template (v1.7)
 # Internal Squad на CREATE (один GET /api/internal-squads, без кеша):
 # 1) us.service.settings.remnawave.internal_squad_name          — fixed
 # 2) us.service.settings.remnawave.internal_squad_pool_names    — least info.membersCount
@@ -27,6 +27,33 @@
 # user is already gone, so the event succeeds. Transport errors, HTTP 5xx,
 # any other status, and HTTP 200 without a numeric response.id stay fatal.
 # ACTIVATE / BLOCK / PROLONGATE keep the strict _user_id_by_username lookup.
+#
+# CREATE is safe to run again after a partial execution. SHM sends this
+# whole script as one SSH command (stdin, no tty). The remote shell can
+# die after Remnawave has created the user and before the storage PUT;
+# an SSH timeout is one such cut (SHM #136 / #137). Spool retries FAIL
+# with no retry cap, so a second POST must not keep the task failed.
+# Before #137 a timeout can be reported as SUCCESS and is not retried;
+# this script cannot reopen those tasks.
+#
+# The only identifier CREATE chooses is the username us_<us.id>. The
+# panel generates uuid, shortUuid and vlessUuid; this script does not
+# send them and does not keep them anywhere except inside the
+# subscription JSON. That JSON is what a partial run failed to store,
+# so a retry cannot compare them with an older SHM record. Ownership
+# of an existing user is response.username plus a positive numeric
+# response.id. Expire, squads and traffic are not compared: they may
+# differ on a user created earlier, and this event does not change them.
+# GET /api/users/by-username reports absence as HTTP 404 errorCode A063
+# ("User with specified params not found"). A025 is a different
+# not-found code and is not absence on this route. Any other 404 is
+# fatal. Before the storage PUT, subscription user.username must be
+# the same username, and user.shortUuid must match the panel user when
+# that user response included one.
+# HTTP 400 errorCode A019 with message "User username already exists"
+# is not success by itself. It only runs that same lookup. A failed
+# transfer, any other status, malformed JSON, or a different user is
+# fatal and does not write storage.
 #
 set -euo pipefail
 
@@ -605,7 +632,280 @@ ${hwid_update_line}
 JSON
 }
 
-log "Remnawave Template v1.6"
+# Prints "ok <id>" or "bad <reason>". Non-zero means the file is not JSON.
+# strict: response.username must be the CREATE username.
+# created: a missing username is allowed; a present one must still match.
+# Does not treat a 404 body or an A019 body as a user.
+_classify_user_body() {
+  local body_file="$1"
+  local mode="$2"
+  jq -e -r --arg username "${USERNAME}" --arg mode "${mode}" '
+    if (.response | type) != "object" then
+      "bad not_object"
+    elif (.response.id | type) != "number" then
+      "bad invalid_id"
+    elif .response.id < 1 or (.response.id | floor) != .response.id then
+      "bad invalid_id"
+    elif ($mode == "strict") and ((.response.username | type) != "string") then
+      "bad username_missing"
+    elif ($mode == "strict") and (.response.username != $username) then
+      "bad username_mismatch"
+    elif ($mode == "created") and ((.response | has("username")) and ((.response.username | type) != "string" or .response.username != $username)) then
+      "bad username_mismatch"
+    else
+      "ok \(.response.id)"
+    end
+  ' "${body_file}" 2>/dev/null
+}
+
+# Absence on GET /api/users/by-username. A025 is not this response:
+# the route uses getUserByUniqueFields and returns A063.
+_body_is_user_absent() {
+  local body_file="$1"
+  jq -e '
+    (.errorCode | type) == "string"
+    and .errorCode == "A063"
+    and (.message | type) == "string"
+    and .message == "User with specified params not found"
+  ' "${body_file}" >/dev/null 2>&1
+}
+
+_user_short_uuid_from_body() {
+  local body_file="$1"
+  jq -r 'if (.response.shortUuid | type) == "string" then .response.shortUuid else "" end' "${body_file}" 2>/dev/null
+}
+
+# CREATE lookup. Returns 0 and sets REMNAWAVE_CREATE_USER_ID when the panel
+# user is this service. Returns 2 only for a completed HTTP 404 whose body
+# is exactly A063. Does not create or modify a user. HTTP 200 is never
+# treated as absence. A shortUuid is remembered when the body has one;
+# an older row that omits it is still accepted.
+_lookup_user_for_create() {
+  local body_file http_code curl_rc classified jq_rc kind user_id
+  [[ -n "${USERNAME}" ]] || fail "CREATE username is empty"
+  REMNAWAVE_CREATE_USER_ID=""
+  body_file="$(mktemp)" || fail "User lookup failed for ${USERNAME}: mktemp failed"
+
+  http_code="$(
+    curl -skS -o "${body_file}" -w "%{http_code}" \
+      -H "$(_auth_header)" \
+      "${PANEL_URL}/api/users/by-username/${USERNAME}"
+  )" && curl_rc=0 || curl_rc=$?
+  http_code="${http_code//$'\r'/}"
+
+  if [[ "${curl_rc}" -ne 0 ]]; then
+    rm -f "${body_file}"
+    fail "User lookup failed for ${USERNAME}: curl exit ${curl_rc}"
+  fi
+  if [[ "${http_code}" == "404" ]]; then
+    if _body_is_user_absent "${body_file}"; then
+      rm -f "${body_file}"
+      return 2
+    fi
+    rm -f "${body_file}"
+    fail "User lookup failed for ${USERNAME}: HTTP 404 is not A063 user-not-found"
+  fi
+  if [[ "${http_code}" != "200" ]]; then
+    rm -f "${body_file}"
+    fail "User lookup failed for ${USERNAME}: HTTP ${http_code}"
+  fi
+
+  classified="$(_classify_user_body "${body_file}" strict)" && jq_rc=0 || jq_rc=$?
+  if [[ "${jq_rc}" -ne 0 || -z "${classified}" || "${classified}" == *$'\n'* ]]; then
+    rm -f "${body_file}"
+    fail "User lookup for ${USERNAME} returned HTTP 200 with malformed JSON"
+  fi
+  kind="${classified%% *}"
+  if [[ "${kind}" == "ok" ]]; then
+    user_id="${classified#ok }"
+    REMNAWAVE_CREATE_SHORT_UUID="$(_user_short_uuid_from_body "${body_file}")" || REMNAWAVE_CREATE_SHORT_UUID=""
+    rm -f "${body_file}"
+    [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "User lookup for ${USERNAME} returned HTTP 200 without a valid user id"
+    REMNAWAVE_CREATE_USER_ID="${user_id}"
+    return 0
+  fi
+  rm -f "${body_file}"
+  if [[ "${classified}" == "bad username_mismatch" ]]; then
+    fail "User lookup for ${USERNAME} returned HTTP 200 for a different username"
+  fi
+  fail "User lookup for ${USERNAME} returned HTTP 200 without a valid user id"
+}
+
+_body_is_username_conflict() {
+  local body_file="$1"
+  jq -e '
+    (.errorCode | type) == "string"
+    and .errorCode == "A019"
+    and (.message | type) == "string"
+    and .message == "User username already exists"
+  ' "${body_file}" >/dev/null 2>&1
+}
+
+_adopt_after_username_conflict() {
+  local lookup_rc
+  set +e
+  _lookup_user_for_create
+  lookup_rc=$?
+  set -e
+  if [[ "${lookup_rc}" -eq 0 ]]; then
+    log "User ${USERNAME} already exists (id=${REMNAWAVE_CREATE_USER_ID}); leaving UUID, subscription and access unchanged"
+    return 0
+  fi
+  if [[ "${lookup_rc}" -eq 2 ]]; then
+    fail "User ${USERNAME} was reported as already existing, but lookup did not find that user"
+  fi
+  fail "User lookup failed for ${USERNAME}"
+}
+
+_accept_created_user_body() {
+  local body_file="$1"
+  local classified jq_rc kind user_id
+  classified="$(_classify_user_body "${body_file}" created)" && jq_rc=0 || jq_rc=$?
+  if [[ "${jq_rc}" -ne 0 || -z "${classified}" || "${classified}" == *$'\n'* ]]; then
+    fail "Create user for ${USERNAME} returned malformed JSON"
+  fi
+  kind="${classified%% *}"
+  if [[ "${kind}" == "ok" ]]; then
+    user_id="${classified#ok }"
+    [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "Create user failed for ${USERNAME}: response has no valid user id"
+    REMNAWAVE_CREATE_SHORT_UUID="$(_user_short_uuid_from_body "${body_file}")" || REMNAWAVE_CREATE_SHORT_UUID=""
+    REMNAWAVE_CREATE_USER_ID="${user_id}"
+    log "Created user ${USERNAME} (id=${user_id})"
+    return 0
+  fi
+  if [[ "${classified}" == "bad username_mismatch" ]]; then
+    fail "Create user for ${USERNAME} returned a different username"
+  fi
+  fail "Create user failed for ${USERNAME}: response has no valid user id"
+}
+
+_fail_create_response() {
+  local http_code="$1"
+  local body_file="$2"
+  local error_code error_message
+  if ! jq -e . "${body_file}" >/dev/null 2>&1; then
+    rm -f "${body_file}"
+    fail "Create user failed for ${USERNAME}: HTTP ${http_code} with malformed JSON"
+  fi
+  error_code="$(jq -r 'if (.errorCode | type) == "string" then .errorCode else "unknown" end' "${body_file}")"
+  error_message="$(jq -r 'if (.message | type) == "string" then .message else "" end' "${body_file}")"
+  rm -f "${body_file}"
+  fail "Create user failed for ${USERNAME}: HTTP ${http_code} ${error_code} ${error_message}"
+}
+
+# POST /api/users only after a completed HTTP 404 lookup.
+# A019 is adopted only when a following lookup proves the same username.
+_post_new_user() {
+  local payload="$1"
+  local body_file http_code curl_rc
+  body_file="$(mktemp)" || fail "Create user failed for ${USERNAME}: mktemp failed"
+
+  http_code="$(
+    curl -skS -o "${body_file}" -w "%{http_code}" \
+      -X POST \
+      -H "$(_auth_header)" \
+      -H 'Content-Type: application/json' \
+      --data "${payload}" \
+      "${PANEL_URL}/api/users"
+  )" && curl_rc=0 || curl_rc=$?
+  http_code="${http_code//$'\r'/}"
+
+  if [[ "${curl_rc}" -ne 0 ]]; then
+    rm -f "${body_file}"
+    fail "Create user failed for ${USERNAME}: curl exit ${curl_rc}"
+  fi
+
+  if [[ "${http_code}" == "200" || "${http_code}" == "201" ]]; then
+    _accept_created_user_body "${body_file}"
+    rm -f "${body_file}"
+    return 0
+  fi
+
+  if [[ "${http_code}" == "400" ]] && _body_is_username_conflict "${body_file}"; then
+    rm -f "${body_file}"
+    _adopt_after_username_conflict
+    return 0
+  fi
+
+  _fail_create_response "${http_code}" "${body_file}"
+}
+
+# Fetch subscription JSON and PUT it to SHM. Does not change the panel user.
+# A non-200 subscription or a failed PUT leaves storage unwritten and fails
+# the script, so a later CREATE can retry this step.
+_save_create_subscription() {
+  local body_file http_code curl_rc sub_json_body payload_file put_rc jq_rc
+  log "Fetch subscription JSON"
+  body_file="$(mktemp)" || fail "Subscription fetch failed for ${USERNAME_SANITIZED}: mktemp failed"
+
+  http_code="$(
+    curl -skS -o "${body_file}" -w "%{http_code}" \
+      -H "$(_auth_header)" \
+      "${PANEL_URL}/api/subscriptions/by-username/${USERNAME_SANITIZED}"
+  )" && curl_rc=0 || curl_rc=$?
+  http_code="${http_code//$'\r'/}"
+
+  if [[ "${curl_rc}" -ne 0 ]]; then
+    rm -f "${body_file}"
+    fail "Subscription fetch failed for ${USERNAME_SANITIZED}: curl exit ${curl_rc}"
+  fi
+  if [[ "${http_code}" != "200" ]]; then
+    rm -f "${body_file}"
+    fail "Subscription fetch failed for ${USERNAME_SANITIZED}: HTTP ${http_code}"
+  fi
+
+  # user.username is the panel username (us_<us.id>). shortUuid is compared
+  # only when the user response included one, so a body that omits it does
+  # not reject a previously created user. A mismatch does not reach PUT.
+  sub_verdict="$(
+    jq -e -r --arg username "${USERNAME}" --arg short "${REMNAWAVE_CREATE_SHORT_UUID}" '
+      .response as $r
+      | if ($r | type) != "object" then "bad not_object"
+        elif ($r.user.username | type) != "string" or $r.user.username != $username then "bad username"
+        elif ($short != "" and (($r.user.shortUuid | type) != "string" or $r.user.shortUuid != $short)) then "bad short_uuid"
+        else "ok"
+        end
+    ' "${body_file}"
+  )" && jq_rc=0 || jq_rc=$?
+  if [[ "${jq_rc}" -ne 0 || -z "${sub_verdict}" || "${sub_verdict}" == *$'\n'* ]]; then
+    rm -f "${body_file}"
+    fail "Subscription JSON for ${USERNAME_SANITIZED} is malformed or missing"
+  fi
+  if [[ "${sub_verdict}" == "bad username" ]]; then
+    rm -f "${body_file}"
+    fail "Subscription JSON for ${USERNAME} does not belong to this user"
+  fi
+  if [[ "${sub_verdict}" != "ok" ]]; then
+    rm -f "${body_file}"
+    fail "Subscription JSON for ${USERNAME} does not match the panel user shortUuid"
+  fi
+
+  sub_json_body="$(
+    jq -e -c 'if (.response | type) != "object" then error("subscription response is not an object") else . end' "${body_file}" \
+      | _normalize_subscription_json \
+      | jq -e -c '.response'
+  )" && jq_rc=0 || jq_rc=$?
+  rm -f "${body_file}"
+  if [[ "${jq_rc}" -ne 0 || -z "${sub_json_body}" || "${sub_json_body}" == "null" ]]; then
+    fail "Subscription JSON for ${USERNAME_SANITIZED} is malformed or missing"
+  fi
+
+  log "Upload JSON to SHM key vpn_mrzb_{{ us.id }}"
+  payload_file="$(mktemp)" || fail "Subscription upload failed for ${USERNAME_SANITIZED}: mktemp failed"
+  printf '%s\n' "${sub_json_body}" > "${payload_file}"
+  set +e
+  curl -skS --fail-with-body -X PUT \
+    -H "session-id: ${SESSION_ID}" \
+    -H "Content-Type: application/json; charset=utf-8" \
+    --data-binary @"${payload_file}" \
+    "${API_URL}/shm/v1/storage/manage/vpn_mrzb_{{ us.id }}" >/dev/null
+  put_rc=$?
+  set -e
+  rm -f "${payload_file}"
+  [[ "${put_rc}" -eq 0 ]] || fail "Upload to SHM storage vpn_mrzb_{{ us.id }} failed: curl exit ${put_rc}"
+}
+
+log "Remnawave Template v1.7"
 log "EVENT=${EVENT}"
 
 case "${EVENT}" in
@@ -618,27 +918,26 @@ case "${EVENT}" in
 
   CREATE)
     log "Create user ${USERNAME}"
-    _select_internal_squad_for_create
-    log "Effective external squad: $(_effective_external_squad_name)"
-    _log_effective_limits
-    payload="$(_build_create_payload)"
-    resp="$(_http_post '/api/users' --data "${payload}")"
-    user_id="$(echo "${resp}" | jq -r '.response.id // empty')"
-    [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "Create user failed: ${resp}"
+    REMNAWAVE_CREATE_USER_ID=""
+    REMNAWAVE_CREATE_SHORT_UUID=""
+    # Direct call, not $(...): return 2 (HTTP 404) must not abort the script.
+    set +e
+    _lookup_user_for_create
+    lookup_rc=$?
+    set -e
+    if [[ "${lookup_rc}" -eq 0 ]]; then
+      log "User ${USERNAME} already exists (id=${REMNAWAVE_CREATE_USER_ID}); leaving UUID, subscription and access unchanged"
+    elif [[ "${lookup_rc}" -eq 2 ]]; then
+      _select_internal_squad_for_create
+      log "Effective external squad: $(_effective_external_squad_name)"
+      _log_effective_limits
+      payload="$(_build_create_payload)"
+      _post_new_user "${payload}"
+    else
+      fail "User lookup failed for ${USERNAME}"
+    fi
 
-    log "Fetch subscription JSON"
-    sub_json="$(_subscription_json_by_username "${USERNAME_SANITIZED}")"
-    sub_json_body="$(echo "${sub_json}" | _normalize_subscription_json | jq -c '.response')"
-
-    log "Upload JSON to SHM key vpn_mrzb_{{ us.id }}"
-    echo "${sub_json_body}" | jq -c '.' > /tmp/payload.json
-    curl -skS -X PUT \
-      -H "session-id: ${SESSION_ID}" \
-      -H "Content-Type: application/json; charset=utf-8" \
-      --data-binary @/tmp/payload.json \
-      "${API_URL}/shm/v1/storage/manage/vpn_mrzb_{{ us.id }}" >/dev/null
-    rm -f /tmp/payload.json
-
+    _save_create_subscription
     log "done"
     ;;
 

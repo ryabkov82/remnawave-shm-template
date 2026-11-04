@@ -90,7 +90,47 @@ _http_delete() {
 
 curl() {
   echo "CURL $*" >> "${CALL_LOG}"
-  echo 200
+  local outfile=""
+  local data=""
+  local method=""
+  local prev=""
+  local arg
+  for arg in "$@"; do
+    if [[ "${prev}" == "-o" ]]; then
+      outfile="${arg}"
+    elif [[ "${prev}" == "--data" || "${prev}" == "--data-binary" ]]; then
+      data="${arg}"
+    elif [[ "${prev}" == "-X" ]]; then
+      method="${arg}"
+    fi
+    prev="${arg}"
+  done
+  local url="${@: -1}"
+  if [[ "${method}" == "POST" && "${url}" == */api/users ]]; then
+    echo "POST /api/users" >> "${CALL_LOG}"
+    if [[ -n "${CREATE_BODY:-}" ]]; then
+      printf '%s' "${data}" > "${CREATE_BODY}"
+    fi
+    if [[ -n "${outfile}" && "${outfile}" != "/dev/null" ]]; then
+      printf '%s' "{\"response\":{\"id\":77,\"username\":\"${USERNAME}\",\"shortUuid\":\"mock-short\"}}" > "${outfile}"
+    fi
+    printf '%s' '201'
+    return 0
+  fi
+  if [[ "${url}" == *"/api/subscriptions/by-username/"* && -n "${outfile}" && "${outfile}" != "/dev/null" ]]; then
+    printf '%s' "{\"response\":{\"subscriptionUrl\":\"https://sub.test/x\",\"user\":{\"username\":\"${USERNAME}\",\"shortUuid\":\"mock-short\"}}}" > "${outfile}"
+    printf '%s' '200'
+    return 0
+  fi
+  if [[ "${url}" == *"/api/users/by-username/"* && -n "${outfile}" && "${outfile}" != "/dev/null" ]]; then
+    if [[ "${EVENT}" == "CREATE" ]]; then
+      printf '%s' '{"message":"User with specified params not found","errorCode":"A063"}' > "${outfile}"
+      printf '%s' '404'
+      return 0
+    fi
+    printf '%s' '{"response":{"id":77}}' > "${outfile}"
+  fi
+  printf '%s' '200'
 }
 """
 
