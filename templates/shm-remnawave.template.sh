@@ -121,16 +121,35 @@ SELECTED_INTERNAL_SQUAD_LOAD=""
 log() { echo "[$(date +'%F %T')] $*"; }
 fail() { echo "ERROR: $*" >&2; exit 1; }
 
+# TEST VM202 loopback API; external PROD URLs keep their original behavior.
+REMNAWAVE_LOCAL_API_HEADERS=()
+if [[ "${PANEL_URL}" == "http://127.0.0.1:3000" ]]; then
+  REMNAWAVE_LOCAL_API_HEADERS=(
+    -H "X-Forwarded-Proto: https"
+    -H "X-Forwarded-For: 127.0.0.1"
+  )
+  if [[ -z "${REMNAWAVE_API_TOKEN}" || "${REMNAWAVE_API_TOKEN}" == "null" ]]; then
+    [[ "${HOME:-}" == /* ]] || fail "TEST local API credential home is invalid"
+    local_token_file="${HOME}/.config/remnawave/lifecycle.token"
+    [[ -f "${local_token_file}" && ! -L "${local_token_file}" && -r "${local_token_file}" ]] ||
+      fail "TEST local API credential file not accessible"
+    [[ "$(stat -c '%a:%u:%h' -- "${local_token_file}")" == "600:$(id -u):1" ]] ||
+      fail "TEST local API credential requires owner-only 0600 regular file"
+    REMNAWAVE_API_TOKEN="$(< "${local_token_file}")"
+  fi
+fi
+
 _auth_header() {
-  [[ -n "${REMNAWAVE_API_TOKEN:-}" ]] || fail "server.settings.remnawave.token is empty"
+  [[ -n "${REMNAWAVE_API_TOKEN:-}" && "${REMNAWAVE_API_TOKEN}" != "null" ]] ||
+    fail "server.settings.remnawave.token is empty"
   echo "Authorization: Bearer ${REMNAWAVE_API_TOKEN}"
 }
 
 # HTTP helpers (Remnawave)
-_http_get()    { local p="$1"; shift; curl -skS -H "$(_auth_header)" "$@" "${PANEL_URL}${p}"; }
-_http_post()   { local p="$1"; shift; curl -skS --fail-with-body -X POST -H "$(_auth_header)" -H 'Content-Type: application/json' "$@" "${PANEL_URL}${p}"; }
-_http_patch()  { local p="$1"; shift; curl -skS --fail-with-body -X PATCH -H "$(_auth_header)" -H 'Content-Type: application/json' "$@" "${PANEL_URL}${p}"; }
-_http_delete() { local p="$1"; shift; curl -skS --fail-with-body -X DELETE -H "$(_auth_header)" "$@" "${PANEL_URL}${p}"; }
+_http_get()    { local p="$1"; shift; curl -skS -H "$(_auth_header)" "${REMNAWAVE_LOCAL_API_HEADERS[@]}" "$@" "${PANEL_URL}${p}"; }
+_http_post()   { local p="$1"; shift; curl -skS --fail-with-body -X POST -H "$(_auth_header)" "${REMNAWAVE_LOCAL_API_HEADERS[@]}" -H 'Content-Type: application/json' "$@" "${PANEL_URL}${p}"; }
+_http_patch()  { local p="$1"; shift; curl -skS --fail-with-body -X PATCH -H "$(_auth_header)" "${REMNAWAVE_LOCAL_API_HEADERS[@]}" -H 'Content-Type: application/json' "$@" "${PANEL_URL}${p}"; }
+_http_delete() { local p="$1"; shift; curl -skS --fail-with-body -X DELETE -H "$(_auth_header)" "${REMNAWAVE_LOCAL_API_HEADERS[@]}" "$@" "${PANEL_URL}${p}"; }
 
 # Helpers
 
@@ -198,7 +217,7 @@ _lookup_user_id_for_remove() {
 
   http_code="$(
     curl -skS -o "${body_file}" -w "%{http_code}" \
-      -H "$(_auth_header)" \
+      -H "$(_auth_header)" "${REMNAWAVE_LOCAL_API_HEADERS[@]}" \
       "${PANEL_URL}/api/users/by-username/${username}"
   )" && curl_rc=0 || curl_rc=$?
 
@@ -688,7 +707,7 @@ _lookup_user_for_create() {
 
   http_code="$(
     curl -skS -o "${body_file}" -w "%{http_code}" \
-      -H "$(_auth_header)" \
+      -H "$(_auth_header)" "${REMNAWAVE_LOCAL_API_HEADERS[@]}" \
       "${PANEL_URL}/api/users/by-username/${USERNAME}"
   )" && curl_rc=0 || curl_rc=$?
   http_code="${http_code//$'\r'/}"
@@ -803,7 +822,7 @@ _post_new_user() {
   http_code="$(
     curl -skS -o "${body_file}" -w "%{http_code}" \
       -X POST \
-      -H "$(_auth_header)" \
+      -H "$(_auth_header)" "${REMNAWAVE_LOCAL_API_HEADERS[@]}" \
       -H 'Content-Type: application/json' \
       --data "${payload}" \
       "${PANEL_URL}/api/users"
@@ -840,7 +859,7 @@ _save_create_subscription() {
 
   http_code="$(
     curl -skS -o "${body_file}" -w "%{http_code}" \
-      -H "$(_auth_header)" \
+      -H "$(_auth_header)" "${REMNAWAVE_LOCAL_API_HEADERS[@]}" \
       "${PANEL_URL}/api/subscriptions/by-username/${USERNAME_SANITIZED}"
   )" && curl_rc=0 || curl_rc=$?
   http_code="${http_code//$'\r'/}"
