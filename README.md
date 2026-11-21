@@ -36,7 +36,9 @@ remnawave:
   # Необязательные параметры:
   shm_tz: Europe/Moscow          # Таймзона SHM, если отличается от системной
   expire_safety_minutes: 0       # Дополнительный буфер в минутах (например, 21)
-  sanitize_username: false       # 🆕 Включает алгоритм приведения username (Marzban-style)
+  sanitize_username: false       # Приведение username (Marzban-style)
+  # user_id_mode: uuid            # Только для Remnawave 2.x (включая VM205 2.8.1).
+  # Для Remnawave 3.x оставьте поле пустым: по умолчанию numeric.
 ```
 
 ### 🔍 Описание параметров

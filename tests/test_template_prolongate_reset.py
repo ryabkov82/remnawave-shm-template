@@ -149,6 +149,7 @@ def _render_full(
         "{{ user.gen_session.id }}": "test-session",
         "{{ config.api.url }}": "https://shm.test",
         "{{ server.settings.remnawave.api }}": "https://panel.test",
+        "{{ server.settings.remnawave.user_id_mode }}": "",
         "{{ server.settings.remnawave.token }}": "test-token",
         "{{ server.settings.remnawave.default_internal_squad_name }}": "Default-Squad",
         "{{ us.service.settings.remnawave.internal_squad_name }}": "",

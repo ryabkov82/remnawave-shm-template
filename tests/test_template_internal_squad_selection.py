@@ -221,6 +221,7 @@ def _render(
         "{{ user.gen_session.id }}": "test-session",
         "{{ config.api.url }}": "https://shm.test",
         "{{ server.settings.remnawave.api }}": "https://panel.test",
+        "{{ server.settings.remnawave.user_id_mode }}": "",
         "{{ server.settings.remnawave.token }}": "test-token",
         "{{ server.settings.remnawave.default_internal_squad_name }}": default_squad_name,
         "{{ us.service.settings.remnawave.internal_squad_name }}": internal_squad_name,

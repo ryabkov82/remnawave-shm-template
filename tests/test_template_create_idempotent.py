@@ -466,6 +466,7 @@ def _render(event: str, panel_url: str, api_url: str) -> str:
         "{{ user.gen_session.id }}": "test-session",
         "{{ config.api.url }}": api_url,
         "{{ server.settings.remnawave.api }}": panel_url,
+        "{{ server.settings.remnawave.user_id_mode }}": "",
         "{{ server.settings.remnawave.token }}": "test-token",
         "{{ server.settings.remnawave.default_internal_squad_name }}": "Default-Squad",
         "{{ us.service.settings.remnawave.internal_squad_name }}": "",

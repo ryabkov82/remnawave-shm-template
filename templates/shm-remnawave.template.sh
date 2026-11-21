@@ -66,6 +66,10 @@ API_URL="{{ config.api.url }}"
 PANEL_URL="{{ server.settings.remnawave.api }}"
 REMNAWAVE_API_TOKEN="{{ server.settings.remnawave.token }}"
 DEFAULT_INTERNAL_SQUAD_NAME="{{ server.settings.remnawave.default_internal_squad_name }}"
+# Remnawave 2.x user-scoped routes use UUID; 3.x uses numeric userId.
+# Keep existing 3.x behavior unless the TEST/legacy server explicitly selects uuid.
+REMNAWAVE_USER_ID_MODE="{{ server.settings.remnawave.user_id_mode }}"
+[[ -z "${REMNAWAVE_USER_ID_MODE}" || "${REMNAWAVE_USER_ID_MODE}" == "null" ]] && REMNAWAVE_USER_ID_MODE="numeric"
 
 # ---- us.service.settings.remnawave.* ----
 SERVICE_INTERNAL_SQUAD_NAME="{{ us.service.settings.remnawave.internal_squad_name }}"
@@ -176,11 +180,24 @@ _expire_iso() {
   date -u -d "@${final_epoch}" +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+_valid_user_id() {
+  local user_id="$1"
+  case "${REMNAWAVE_USER_ID_MODE}" in
+    numeric) [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] ;;
+    uuid) [[ "${user_id}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] ;;
+    *) return 1 ;;
+  esac
+}
+
 _user_id_by_username() {
   local username="$1"
   local user_id
-  user_id="$(_http_get "/api/users/by-username/${username}" | jq -r '.response.id // empty')"
-  [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "User not found: ${username}"
+  user_id="$(_http_get "/api/users/by-username/${username}" | jq -r --arg mode "${REMNAWAVE_USER_ID_MODE}" --arg name "${username}" '
+    if $mode == "uuid" then
+      if .response.username == $name then .response.uuid // empty else empty end
+    else .response.id // empty end
+  ')" || fail "User lookup failed: ${username}"
+  _valid_user_id "${user_id}" || fail "User not found: ${username}"
   echo "${user_id}"
 }
 
@@ -217,12 +234,16 @@ _lookup_user_id_for_remove() {
     fail "User lookup failed for ${username}: HTTP ${http_code}"
   fi
 
-  user_id="$(jq -r '.response.id // empty' "${body_file}")" && jq_rc=0 || jq_rc=$?
+  user_id="$(jq -r --arg mode "${REMNAWAVE_USER_ID_MODE}" --arg name "${username}" '
+    if $mode == "uuid" then
+      if .response.username == $name then .response.uuid // empty else empty end
+    else .response.id // empty end
+  ' "${body_file}")" && jq_rc=0 || jq_rc=$?
   rm -f "${body_file}"
   if [[ "${jq_rc}" -ne 0 ]]; then
     fail "User lookup for ${username} returned HTTP 200 with malformed JSON"
   fi
-  [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "User lookup for ${username} returned HTTP 200 without a valid user id"
+  _valid_user_id "${user_id}" || fail "User lookup for ${username} returned HTTP 200 without a valid user id"
   REMNAWAVE_REMOVE_USER_ID="${user_id}"
   return 0
 }
@@ -503,10 +524,10 @@ _resolve_external_squad_uuid_by_name() {
   echo "${uuid}"
 }
 
-# Actions (Remnawave 3.x numeric userId)
+# Actions (2.x UUID or 3.x numeric userId, explicitly configured per SHM server).
 _require_user_id() {
   local user_id="$1"
-  [[ "${user_id}" =~ ^[1-9][0-9]*$ ]] || fail "Invalid Remnawave user id: '${user_id}'"
+  _valid_user_id "${user_id}" || fail "Invalid Remnawave user id"
 }
 
 _revoke_user_subscription() { local user_id="$1"; _require_user_id "${user_id}"; _http_post "/api/users/${user_id}/actions/revoke" --data '{}' >/dev/null; }
@@ -614,6 +635,12 @@ _build_update_payload() {
   hwid_device_limit="$(_effective_hwid_device_limit)"
   local hwid_update_comma=""
   local hwid_update_line=""
+  local identity_json
+  if [[ "${REMNAWAVE_USER_ID_MODE}" == "uuid" ]]; then
+    identity_json="\"uuid\": \"${user_id}\""
+  else
+    identity_json="\"id\": ${user_id}"
+  fi
 
   if [[ -n "${hwid_device_limit}" ]]; then
     hwid_update_comma=","
@@ -622,7 +649,7 @@ _build_update_payload() {
 
   cat <<JSON
 {
-  "id": ${user_id},
+  ${identity_json},
   "status": "${STATUS_ACTIVE}",
   "trafficLimitBytes": ${traffic_limit_bytes},
   "trafficLimitStrategy": "${traffic_limit_strategy}",
@@ -905,7 +932,11 @@ _save_create_subscription() {
   [[ "${put_rc}" -eq 0 ]] || fail "Upload to SHM storage vpn_mrzb_{{ us.id }} failed: curl exit ${put_rc}"
 }
 
-log "Remnawave Template v1.7"
+log "Remnawave Template v1.8"
+case "${REMNAWAVE_USER_ID_MODE}" in
+  numeric|uuid) ;;
+  *) fail "Invalid server.settings.remnawave.user_id_mode (expected numeric or uuid)" ;;
+esac
 log "EVENT=${EVENT}"
 
 case "${EVENT}" in

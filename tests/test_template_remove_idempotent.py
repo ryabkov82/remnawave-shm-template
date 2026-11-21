@@ -40,12 +40,14 @@ class State:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.calls: List[Dict[str, str]] = []
+        self.payloads: List[bytes] = []
         self.user_status = 200
         self.user_body = b'{"response":{"id":77}}'
 
     def reset(self, *, status: int = 200, body: bytes = b'{"response":{"id":77}}') -> None:
         with self.lock:
             self.calls.clear()
+            self.payloads.clear()
             self.user_status = status
             self.user_body = body
 
@@ -65,11 +67,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _record(self) -> None:
         length = int(self.headers.get("Content-Length") or "0")
-        if length:
-            self.rfile.read(length)
+        body = self.rfile.read(length) if length else b""
         parsed = urllib.parse.urlparse(self.path)
         with STATE.lock:
             STATE.calls.append({"method": self.command, "path": parsed.path})
+            STATE.payloads.append(body)
 
     def _reply(self, status: int, body: bytes) -> None:
         self.send_response(status)
@@ -101,13 +103,14 @@ class Handler(BaseHTTPRequestHandler):
         self._reply(200, b'{"response":{"ok":true}}')
 
 
-def _render(event: str, panel_url: str, api_url: str) -> str:
+def _render(event: str, panel_url: str, api_url: str, *, user_id_mode: str = "") -> str:
     text = TEMPLATE.read_text(encoding="utf-8")
     replacements = {
         "{{ event_name }}": event,
         "{{ user.gen_session.id }}": "test-session",
         "{{ config.api.url }}": api_url,
         "{{ server.settings.remnawave.api }}": panel_url,
+        "{{ server.settings.remnawave.user_id_mode }}": user_id_mode,
         "{{ server.settings.remnawave.token }}": "test-token",
         "{{ server.settings.remnawave.default_internal_squad_name }}": "Default-Squad",
         "{{ us.service.settings.remnawave.internal_squad_name }}": "",
@@ -177,9 +180,10 @@ class RemoveIdempotencyTests(DisableEnvProxiesMixin, unittest.TestCase):
         api_url: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         path_prefix: Optional[str] = None,
+        user_id_mode: str = "",
     ) -> Dict[str, Any]:
         base = f"http://127.0.0.1:{self.port}"
-        rendered = _render(event, panel_url or base, api_url or base)
+        rendered = _render(event, panel_url or base, api_url or base, user_id_mode=user_id_mode)
         with tempfile.TemporaryDirectory() as tmp:
             script = os.path.join(tmp, "rendered.sh")
             Path(script).write_text(rendered, encoding="utf-8")
@@ -202,6 +206,68 @@ class RemoveIdempotencyTests(DisableEnvProxiesMixin, unittest.TestCase):
             "stderr": proc.stderr,
             "calls": _calls(),
         }
+
+    def test_uuid_mode_remove_uses_uuid_only(self) -> None:
+        uuid = "b45c836d-6c11-4a3f-9554-ba2a191ba156"
+        STATE.reset(body=json.dumps({"response": {
+            "username": "us_71", "id": 77, "uuid": uuid,
+        }}).encode())
+        result = self._run("REMOVE", user_id_mode="uuid")
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(result["calls"], [
+            ("GET", USER_PATH),
+            ("POST", f"/api/users/{uuid}/actions/revoke"),
+            ("DELETE", f"/api/users/{uuid}"),
+            ("DELETE", SHM_KEY_PATH),
+        ])
+
+    def test_uuid_mode_rejects_foreign_user(self) -> None:
+        STATE.reset(body=json.dumps({"response": {
+            "username": "us_99", "id": 77,
+            "uuid": "b45c836d-6c11-4a3f-9554-ba2a191ba156",
+        }}).encode())
+        result = self._run("REMOVE", user_id_mode="uuid")
+        self.assertNotEqual(result["code"], 0)
+        self.assertIn("without a valid user id", result["stderr"])
+        self.assertEqual(result["calls"], [("GET", USER_PATH)])
+
+    def test_uuid_mode_rejects_malformed_uuid(self) -> None:
+        for bad in ("77", "not-a-uuid", "../other", ""):
+            with self.subTest(bad=bad):
+                STATE.reset(body=json.dumps({"response": {
+                    "username": "us_71", "id": 77, "uuid": bad,
+                }}).encode())
+                result = self._run("REMOVE", user_id_mode="uuid")
+                self.assertNotEqual(result["code"], 0)
+                self.assertEqual(result["calls"], [("GET", USER_PATH)])
+
+    def test_uuid_mode_native_actions_and_patch_selector(self) -> None:
+        uuid = "b45c836d-6c11-4a3f-9554-ba2a191ba156"
+        body = json.dumps({"response": {"id": 77, "uuid": uuid,
+                                         "username": "us_71"}}).encode()
+        for event, action in (("ACTIVATE", "enable"),
+                              ("BLOCK", "disable"),
+                              ("PROLONGATE", "reset-traffic")):
+            with self.subTest(event=event):
+                STATE.reset(body=body)
+                result = self._run(event, user_id_mode="uuid")
+                self.assertEqual(result["code"], 0, result["stderr"])
+                self.assertIn(("POST", f"/api/users/{uuid}/actions/{action}"),
+                              result["calls"])
+                if event != "BLOCK":
+                    self.assertIn(("PATCH", "/api/users"), result["calls"])
+                    with STATE.lock:
+                        payload = STATE.payloads[-1]
+                    parsed = json.loads(payload)
+                    self.assertEqual(parsed["uuid"], uuid)
+                    self.assertNotIn("id", parsed)
+
+    def test_invalid_user_id_mode_fails_before_network(self) -> None:
+        result = self._run("REMOVE", user_id_mode="something-invalid")
+        self.assertNotEqual(result["code"], 0)
+        self.assertIn("Invalid server.settings.remnawave.user_id_mode",
+                      result["stderr"])
+        self.assertEqual(result["calls"], [])
 
     def test_remove_existing_user_revokes_and_deletes(self) -> None:
         result = self._run("REMOVE")
