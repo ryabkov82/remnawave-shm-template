@@ -403,6 +403,14 @@ _other_live_pack() {
           | ($p.w | tonumber) * 100 + ((($p.f // "") + "00")[0:2] | tonumber)
         else -1 end;
     def dated: (.withdraw_date | type) == "string" and (.withdraw_date | length) > 0;
+    def period_end_ok:
+      (try capture("^(?<y>[0-9]{4})-(?<m>[0-9]{2})-(?<d>[0-9]{2})T(?<H>[0-9]{2}):(?<M>[0-9]{2}):(?<S>[0-9]{2})Z$") catch null) as $p
+      | if $p == null then false
+        else ($p.y | tonumber) as $y | ($p.m | tonumber) as $m | ($p.d | tonumber) as $d
+          | ($p.H | tonumber) as $hh | ($p.M | tonumber) as $mm | ($p.S | tonumber) as $ss
+          | $y >= 1 and $m >= 1 and $m <= 12 and $d >= 1 and $hh <= 23 and $mm <= 59 and $ss <= 59
+            and $d <= ([0,31,(if ($y % 4 == 0 and ($y % 100 != 0 or $y % 400 == 0)) then 29 else 28 end),31,30,31,30,31,31,30,31,30,31][$m])
+        end;
     def paid_match($expected):
       dated
       and (.withdraw_id | type) == "number" and .withdraw_id > 0
@@ -422,6 +430,7 @@ _other_live_pack() {
         elif ($row.settings.parent_user_service_id | tostring) != $parent then .
         elif ([($row.status // "") | ascii_upcase] | .[0]) as $status
           | ($status != "ACTIVE" and $status != "REMOVED" and $status != "PROGRESS") then .
+        elif ($row.settings.period_ends_at | period_end_ok | not) then error("unreadable")
         else
           [ $paid[] | select((.user_service_id | tostring) == ($row.user_service_id | tostring)) ] as $mine
           | ($row.settings.expected_amount | cents) as $expected

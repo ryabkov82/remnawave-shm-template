@@ -1152,6 +1152,22 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(_patches(world), [])
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
 
+    def test_remove_retries_when_another_pack_end_date_is_invalid(self) -> None:
+        period = "2026-11"
+        _, end = _period_bounds(period)
+        epoch = _stamp_epoch(end) + 60
+        for raw_end in ("2026-02-31T00:20:00Z", "not-a-date", "2026-12-01 03:20:00"):
+            newer, money = _grant("2026-12", "ACTIVE")
+            newer["settings"]["period_ends_at"] = raw_end
+            world = World(period)
+            world.user["trafficLimitBytes"] = TARGET
+            world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+            result = self._remove(world, epoch, services=[newer], withdraws=[money])
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(_reason(result), "history_unreadable")
+            self.assertEqual(_patches(world), [])
+            self.assertEqual(world.user["trafficLimitBytes"], TARGET)
+
     def test_remove_without_confirmed_parent_does_not_patch(self) -> None:
         period = "2026-11"
         _, end = _period_bounds(period)
