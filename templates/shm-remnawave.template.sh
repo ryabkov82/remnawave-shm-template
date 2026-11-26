@@ -28,15 +28,17 @@
 # any other status, and HTTP 200 without a numeric response.id stay fatal.
 # ACTIVATE / BLOCK / PROLONGATE keep the strict _user_id_by_username lookup.
 #
-# ACTIVATE and PROLONGATE of a VFF Standard subscription keep a paid
-# service-17 pack for the current Remnawave month. The pack list and its
-# withdraws are read from stock SHM objects while the template is rendered,
-# so the SSH host does not receive an SHM admin token. CREATE, BLOCK, REMOVE,
-# UPDATE, Friends Connect and Premium keep the catalog limit. Traffic reset
-# is unchanged. TRAFFIC_ADDON_CLOCK_FILE is a test seam and is unset in
-# Production. An unreadable pack history does not replace an elevated panel
-# limit with the catalog base; if that panel limit cannot be read, the
-# script exits 1 and spool retries the event.
+# ACTIVATE and PROLONGATE of a VFF Standard subscription (services 3–6,
+# category vpn-mz-test, strategy MONTH) keep a paid service-17 pack for the
+# current Remnawave month. SHM renders user.services.list and user.wd.list
+# only inside that IF, immediately before SSH, so other events and categories
+# do not query pack history and the SSH host does not receive an SHM token.
+# The current service-17 catalog does not cancel a pack already stored in
+# user_services.settings. CREATE, BLOCK, REMOVE, UPDATE, Friends Connect and
+# Premium keep the catalog limit. Traffic reset is unchanged.
+# TRAFFIC_ADDON_CLOCK_FILE is a test seam and is unset in Production.
+# Unreadable pack history keeps the panel limit, including 0 (unlimited).
+# If that limit cannot be read, the script exits 1 and spool retries.
 #
 # CREATE is safe to run again after a partial execution. SHM sends this
 # whole script as one SSH command (stdin, no tty). The remote shell can
@@ -114,13 +116,18 @@ PARENT_CATEGORY="{{ us.service.category }}"
 PARENT_SERVICE_ID="{{ us.service_id }}"
 PARENT_US_ID="{{ us.id }}"
 PARENT_USER_ID="{{ us.user_id }}"
-# Service 17, its instances (including REMOVED) and its withdraws. Rendered
-# on the SHM host. status=ANY is the stock list switch that keeps REMOVED rows.
-ADDON_CATALOG_JSON="$(cat <<'__SHM_ADDON_CATALOG_JSON__'
-__SHM_JSON__{{ toJson(service(17).config) }}
-__SHM_ADDON_CATALOG_JSON__
-)"
-ADDON_CATALOG_JSON="${ADDON_CATALOG_JSON#__SHM_JSON__}"
+# Pack history is queried only for ACTIVATE/PROLONGATE of VFF Standard MONTH.
+# status=ANY is the stock list switch that keeps REMOVED rows. list() adds no
+# LIMIT unless one is passed, and spool parses this template inside SSH send,
+# immediately before the command runs. Other events leave the sentinels below.
+ADDON_HISTORY_MODE="skip"
+ADDON_SERVICES_JSON="null"
+ADDON_WITHDRAWS_JSON="null"
+# {{ IF event_name == 'ACTIVATE' OR event_name == 'PROLONGATE' }}
+# {{ IF us.service.category == 'vpn-mz-test' }}
+# {{ IF us.service.settings.remnawave.traffic_limit_strategy.upper == 'MONTH' }}
+# {{ IF us.service_id == 3 OR us.service_id == 4 OR us.service_id == 5 OR us.service_id == 6 }}
+ADDON_HISTORY_MODE="read"
 ADDON_SERVICES_JSON="$(cat <<'__SHM_ADDON_SERVICES_JSON__'
 __SHM_JSON__{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}
 __SHM_ADDON_SERVICES_JSON__
@@ -131,6 +138,10 @@ __SHM_JSON__{{ toJson(user.wd.list(where = { service_id = 17 })) }}
 __SHM_ADDON_WITHDRAWS_JSON__
 )"
 ADDON_WITHDRAWS_JSON="${ADDON_WITHDRAWS_JSON#__SHM_JSON__}"
+# {{ END }}
+# {{ END }}
+# {{ END }}
+# {{ END }}
 
 # ---- server.settings.remnawave optional ----
 REMNAWAVE_SHM_TZ="{{ server.settings.remnawave.shm_tz }}"
@@ -497,8 +508,12 @@ _pack_applies_now() {
 }
 
 # Prints "use <bytes>" or "preserve". Friends Connect, Premium and every
-# non-MONTH tariff get the catalog value. A paid current pack prints its
-# stored applied_limit_bytes. Unreadable history prints preserve.
+# non-MONTH tariff get the catalog value and do not read pack history.
+# A paid current pack uses the limit stored on that instance. The live
+# service-17 catalog is not consulted. One applicable pack is written only
+# when the panel limit is still the saved base or the saved total. Any other
+# numeric panel limit, including 0, is left in place. Unreadable history
+# prints preserve.
 _addon_limit_decision() {
   local base="$1"
   if [[ "${PARENT_CATEGORY}" != "vpn-mz-test" ]]; then
@@ -509,10 +524,37 @@ _addon_limit_decision() {
     echo "use ${base}"
     return 0
   fi
+  case "${PARENT_SERVICE_ID}" in
+    3|4|5|6) ;;
+    *)
+      echo "use ${base}"
+      return 0
+      ;;
+  esac
+  if [[ "${ADDON_HISTORY_MODE}" != "read" ]]; then
+    echo "use ${base}"
+    return 0
+  fi
+  # toJson returns nothing for an empty list, so a blank value is a successful
+  # empty history. JSON null and any other non-JSON value stay unreadable.
+  local rows_json="${ADDON_SERVICES_JSON}"
+  local withdraws_json="${ADDON_WITHDRAWS_JSON}"
+  if [[ -z "${rows_json//[[:space:]]/}" ]]; then
+    rows_json="[]"
+  fi
+  if [[ -z "${withdraws_json//[[:space:]]/}" ]]; then
+    withdraws_json="[]"
+  fi
   local classified
-  if ! classified="$(jq -n -er --arg parent "${PARENT_US_ID}" --arg service "${PARENT_SERVICE_ID}" --arg user "${PARENT_USER_ID}" --argjson catalog "${ADDON_CATALOG_JSON}" --argjson rows "${ADDON_SERVICES_JSON}" --argjson withdraws "${ADDON_WITHDRAWS_JSON}" '
+  if ! classified="$(jq -n -er --arg parent "${PARENT_US_ID}" --arg user "${PARENT_USER_ID}" --argjson rows "${rows_json}" --argjson withdraws "${withdraws_json}" '
     def as_rows:
       if type == "array" then .
+      elif type == "object" and .user_service_id != null then [.]
+      elif type == "object" then [ .[] ]
+      else error("shape") end;
+    def as_withdraws:
+      if type == "array" then .
+      elif type == "object" and .withdraw_id != null then [.]
       elif type == "object" then [ .[] ]
       else error("shape") end;
     def cents:
@@ -539,18 +581,9 @@ _addon_limit_decision() {
       and (.applied_limit_bytes | safeint)
       and .applied_limit_bytes == (.base_limit_bytes + .addon_bytes)
       and ((.expected_amount | cents) > 0);
-    if ($catalog | type) != "object"
-      or ($catalog.traffic_addon | type) != "object"
-      or $catalog.traffic_addon.brand != "vff"
-      or $catalog.traffic_addon.parent_category != "vpn-mz-test"
-      or $catalog.traffic_addon.strategy != "MONTH"
-      or ($catalog.traffic_addon.parent_service_ids | type) != "array"
-      or (($catalog.traffic_addon.parent_service_ids | map(tostring)) | index($service) | not)
-      then {action:"use"}
-    else
-      ($rows | as_rows) as $services
-      | ($withdraws | as_rows) as $paid
-      | reduce $services[] as $row ({items:[]};
+    ($rows | as_rows) as $services
+    | ($withdraws | as_withdraws) as $paid
+    | reduce $services[] as $row ({items:[]};
           if ($row | type) != "object" or ($row.service_id | tostring) != "17" then error("row")
           elif ($row.settings | type) != "object" then error("settings")
           elif ($row.settings.parent_user_service_id | tostring) != $parent then .
@@ -568,14 +601,13 @@ _addon_limit_decision() {
                 ) ] | length ) as $matches
               | ( [ $mine[] | select((.withdraw_date | type) == "string" and (.withdraw_date | length) > 0) ] | length ) as $dated
               | if $matches > 0 and (( $row.status | ascii_upcase ) == "ACTIVE" or ($row.status | ascii_upcase) == "REMOVED" or ($row.status | ascii_upcase) == "PROGRESS") then
-                  .items += [{kind:"grant", applied: ($row.settings.applied_limit_bytes | tostring), start:$row.settings.period_starts_at, end:$row.settings.period_ends_at}]
+                  .items += [{kind:"grant", applied: ($row.settings.applied_limit_bytes | tostring), base: ($row.settings.base_limit_bytes | tostring), start:$row.settings.period_starts_at, end:$row.settings.period_ends_at}]
                 elif $dated > 0 then
                   .items += [{kind:"bad", start:$row.settings.period_starts_at, end:$row.settings.period_ends_at}]
                 else . end
               end
           end
         )
-    end
   ' )"; then
     echo "preserve"
     return 0
@@ -608,7 +640,7 @@ _addon_limit_decision() {
     if [[ "${kind}" == "bad" ]]; then
       bad=1
     elif [[ "${kind}" == "grant" ]]; then
-      grants+=("$(jq -r '.applied' <<<"${line}")")
+      grants+=("$(jq -r '.applied + ":" + .base' <<<"${line}")")
     else
       echo "preserve"
       return 0
@@ -622,7 +654,17 @@ _addon_limit_decision() {
     echo "use ${base}"
     return 0
   fi
-  echo "use ${grants[0]}"
+  local applied settings_base
+  applied="${grants[0]%%:*}"
+  settings_base="${grants[0]#*:}"
+  if [[ ! "${PANEL_TRAFFIC_LIMIT}" =~ ^[0-9]+$ ]]; then
+    fail "panel traffic limit is unreadable; refusing to replace it"
+  fi
+  if [[ "${PANEL_TRAFFIC_LIMIT}" == "${settings_base}" || "${PANEL_TRAFFIC_LIMIT}" == "${applied}" ]]; then
+    echo "use ${applied}"
+    return 0
+  fi
+  echo "preserve"
 }
 
 _prepare_update_limit() {
@@ -635,11 +677,7 @@ _prepare_update_limit() {
       ;;
     preserve)
       [[ "${PANEL_TRAFFIC_LIMIT}" =~ ^[0-9]+$ ]] || fail "panel traffic limit is unreadable; refusing to replace it"
-      if (( PANEL_TRAFFIC_LIMIT > base )); then
-        UPDATE_TRAFFIC_LIMIT="${PANEL_TRAFFIC_LIMIT}"
-      else
-        UPDATE_TRAFFIC_LIMIT="${base}"
-      fi
+      UPDATE_TRAFFIC_LIMIT="${PANEL_TRAFFIC_LIMIT}"
       ;;
     *)
       fail "addon limit decision is unreadable"

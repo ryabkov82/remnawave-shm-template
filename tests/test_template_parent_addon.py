@@ -158,6 +158,8 @@ def _render(
     withdraws_raw: Optional[str] = None,
 ) -> str:
     text = TEMPLATE.read_text(encoding="utf-8")
+    # The live service-17 catalog is not part of this template.
+    del catalog
     replacements = {
         "{{ event_name }}": event,
         "{{ user.gen_session.id }}": "test-session",
@@ -179,7 +181,11 @@ def _render(
         "{{ us.service.category }}": category,
         "{{ us.service_id }}": service_id,
         "{{ us.user_id }}": USER,
-        "{{ toJson(service(17).config) }}": json.dumps(catalog if catalog is not None else _catalog()),
+        "# {{ IF event_name == 'ACTIVATE' OR event_name == 'PROLONGATE' }}": "",
+        "# {{ IF us.service.category == 'vpn-mz-test' }}": "",
+        "# {{ IF us.service.settings.remnawave.traffic_limit_strategy.upper == 'MONTH' }}": "",
+        "# {{ IF us.service_id == 3 OR us.service_id == 4 OR us.service_id == 5 OR us.service_id == 6 }}": "",
+        "# {{ END }}": "",
         "{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}": rows_raw
         if rows_raw is not None
         else json.dumps([] if rows is None else rows),
@@ -401,6 +407,106 @@ class ParentAddonTests(unittest.TestCase):
         base = _run("PROLONGATE", panel_limit=BASE, rows=rows, withdraws=withdraws)
         self.assertEqual(base["code"], 0, base["stderr"])
         self.assertEqual(base["patch"]["trafficLimitBytes"], BASE)
+
+    def test_history_reads_only_for_standard_activate_and_prolongate(self) -> None:
+        text = TEMPLATE.read_text(encoding="utf-8")
+        self.assertNotIn("service(17)", text)
+        self.assertNotIn("parent_service_ids", text)
+        start = text.index("# {{ IF event_name == 'ACTIVATE' OR event_name == 'PROLONGATE' }}")
+        end = text.index("# {{ END }}\n# {{ END }}\n# {{ END }}\n# {{ END }}", start)
+        block = text[start:end]
+        services_call = "toJson(user.services.list(where = { service_id = 17, status = 'ANY' }))"
+        withdraws_call = "toJson(user.wd.list(where = { service_id = 17 }))"
+        self.assertEqual(text.count(services_call), 1)
+        self.assertEqual(text.count(withdraws_call), 1)
+        self.assertIn(services_call, block)
+        self.assertIn(withdraws_call, block)
+        self.assertIn("# {{ IF us.service.category == 'vpn-mz-test' }}", block)
+        self.assertIn("# {{ IF us.service.settings.remnawave.traffic_limit_strategy.upper == 'MONTH' }}", block)
+        self.assertIn("# {{ IF us.service_id == 3 OR us.service_id == 4 OR us.service_id == 5 OR us.service_id == 6 }}", block)
+        outside = text[:start] + text[end:]
+        self.assertNotIn(services_call, outside)
+        self.assertNotIn(withdraws_call, outside)
+        for event in ("CREATE", "BLOCK", "REMOVE", "UPDATE"):
+            self.assertNotIn(f"event_name == '{event}'", block)
+
+    def test_empty_history_uses_catalog_even_over_manual_or_zero(self) -> None:
+        elevated = _run("PROLONGATE", panel_limit=TARGET, rows_raw="", withdraws_raw="")
+        self.assertEqual(elevated["code"], 0, elevated["stderr"])
+        self.assertEqual(elevated["patch"]["trafficLimitBytes"], BASE)
+        zero = _run("PROLONGATE", panel_limit=0, rows_raw="   ", withdraws_raw="\n")
+        self.assertEqual(zero["code"], 0, zero["stderr"])
+        self.assertEqual(zero["patch"]["trafficLimitBytes"], BASE)
+
+    def test_tariff_removed_from_allow_list_keeps_stored_pack(self) -> None:
+        catalog = _catalog(parent_ids=[4, 5])
+        catalog["traffic_addon"]["bytes"] = 1000
+        result = _run(
+            "PROLONGATE",
+            catalog=catalog,
+            rows=[_row(status="REMOVED")],
+            withdraws=[_withdraw()],
+        )
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(result["patch"]["trafficLimitBytes"], TARGET)
+
+    def test_unavailable_catalog_keeps_paid_pack(self) -> None:
+        result = _run(
+            "ACTIVATE",
+            catalog=None,
+            rows=[_row(status="ACTIVE")],
+            withdraws=[_withdraw()],
+        )
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(result["patch"]["trafficLimitBytes"], TARGET)
+        self.assertNotIn("service(17)", TEMPLATE.read_text(encoding="utf-8"))
+
+    def test_paid_progress_does_not_overwrite_manual_limit(self) -> None:
+        manual = _run(
+            "PROLONGATE",
+            panel_limit=999,
+            rows=[_row(status="PROGRESS")],
+            withdraws=[_withdraw()],
+        )
+        self.assertEqual(manual["code"], 0, manual["stderr"])
+        self.assertEqual(manual["patch"]["trafficLimitBytes"], 999)
+        unlimited = _run(
+            "ACTIVATE",
+            panel_limit=0,
+            rows=[_row(status="PROGRESS")],
+            withdraws=[_withdraw()],
+        )
+        self.assertEqual(unlimited["code"], 0, unlimited["stderr"])
+        self.assertEqual(unlimited["patch"]["trafficLimitBytes"], 0)
+
+    def test_unreadable_history_keeps_zero_and_broken_row(self) -> None:
+        zero = _run("PROLONGATE", panel_limit=0, rows_raw="null")
+        self.assertEqual(zero["code"], 0, zero["stderr"])
+        self.assertEqual(zero["patch"]["trafficLimitBytes"], 0)
+        broken = _run(
+            "PROLONGATE",
+            panel_limit=TARGET,
+            rows_raw="{",
+        )
+        self.assertEqual(broken["code"], 0, broken["stderr"])
+        self.assertEqual(broken["patch"]["trafficLimitBytes"], TARGET)
+        incomplete = _run(
+            "PROLONGATE",
+            panel_limit=TARGET,
+            rows=[{"user_service_id": 1, "service_id": 17, "status": "ACTIVE", "settings": "nope"}],
+            withdraws=[],
+        )
+        self.assertEqual(incomplete["code"], 0, incomplete["stderr"])
+        self.assertEqual(incomplete["patch"]["trafficLimitBytes"], TARGET)
+
+    def test_single_template_toolkit_row_is_a_pack(self) -> None:
+        result = _run(
+            "PROLONGATE",
+            rows_raw=json.dumps(_row(status="PROGRESS")),
+            withdraws_raw=json.dumps(_withdraw()),
+        )
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(result["patch"]["trafficLimitBytes"], TARGET)
 
     def test_scalar_service_map_still_finds_the_pack(self) -> None:
         row = _row(status="REMOVED")
