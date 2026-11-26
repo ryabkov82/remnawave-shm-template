@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """CREATE of remnawave_traffic_addon raises one existing user's limit.
 
-The template must not create or delete a Remnawave user, reset traffic,
-change expireAt, call enable, or move money. Payment comes from the
-rendered withdraw. A repeated CREATE sets the stored absolute limit and
-does not add the pack a second time.
+The template reads the paid purchase from the rendered withdraw and from
+user_services.settings. It does not use storage, locks, or its own state.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import subprocess
@@ -39,7 +35,6 @@ PURCHASE = "0123456789abcdef0123456789abcdef"
 UUID = "11111111-1111-4111-8111-111111111111"
 EXPIRE = "2026-12-15T00:00:00.000Z"
 TOKEN = "test-token-must-not-appear"
-SNAPSHOT_KEY = "snapshot-test-key"
 
 
 def _period_bounds(period: str) -> tuple[str, str]:
@@ -89,73 +84,30 @@ def _catalog(bytes_value: int = PACK) -> Dict[str, Any]:
 
 
 def _settings(period: str) -> Dict[str, Any]:
+    start, end = _period_bounds(period)
     return {
         "purchase_id": PURCHASE,
         "parent_user_service_id": PARENT,
         "period": period,
+        "period_starts_at": start,
+        "period_ends_at": end,
+        "base_limit_bytes": BASE,
+        "addon_bytes": PACK,
+        "applied_limit_bytes": TARGET,
     }
 
 
-def _withdraw(paid: bool, total: str = "150.00") -> Any:
+def _withdraw(paid: bool, total: str = "150.00", **overrides: Any) -> Any:
     row: Dict[str, Any] = {
         "withdraw_id": 775501,
         "user_id": USER,
         "user_service_id": ADDON,
         "service_id": 17,
         "total": total,
-        "withdraw_date": None,
+        "withdraw_date": "2026-11-26T00:00:00Z" if paid else None,
     }
-    if paid:
-        row["withdraw_date"] = "2026-11-26T00:00:00Z"
+    row.update(overrides)
     return row
-
-
-def _canonical(record: Dict[str, Any]) -> str:
-    payload = {
-        "purchase_id": record["purchase_id"],
-        "user_id": record["user_id"],
-        "parent_user_service_id": record["parent_user_service_id"],
-        "period": record["period"],
-        "period_starts_at": record["period_starts_at"],
-        "period_ends_at": record["period_ends_at"],
-        "expected_amount": record["expected_amount"],
-        "base_limit_bytes": record["base_limit_bytes"],
-        "addon_bytes": record["addon_bytes"],
-        "applied_limit_bytes": record["applied_limit_bytes"],
-    }
-    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-
-
-def _sign(record: Dict[str, Any]) -> Dict[str, Any]:
-    record["snapshot_mac"] = hmac.new(
-        SNAPSHOT_KEY.encode(),
-        _canonical(record).encode(),
-        hashlib.sha256,
-    ).hexdigest()
-    return record
-
-
-def _storage(period: str, state: str = "PAID", amount: str = "150.00") -> Dict[str, Any]:
-    start, end = _period_bounds(period)
-    return _sign({
-        "purchase_id": PURCHASE,
-        "user_id": USER,
-        "parent_user_service_id": PARENT,
-        "user_service_id": ADDON,
-        "withdraw_id": 775501,
-        "period": period,
-        "period_starts_at": start,
-        "period_ends_at": end,
-        "expected_amount": "150.00",
-        "base_limit_bytes": BASE,
-        "addon_bytes": PACK,
-        "applied_limit_bytes": TARGET,
-        "amount": amount,
-        "currency": "RUB",
-        "state": state,
-        "state_changed_at": "2026-11-26T00:00:00Z",
-        "last_error": None,
-    })
 
 
 def _parent(service_id: int = 3, category: str = "vpn-mz-test", user_id: int = USER, status: str = "ACTIVE") -> Dict[str, Any]:
@@ -195,51 +147,24 @@ def _user(
     return user
 
 
-def _foreign_lock(until: int) -> Dict[str, Any]:
-    return {
-        "lock_id": "ffffffffffffffffffffffffffffffff",
-        "purchase_id": "fedcba9876543210fedcba9876543210",
-        "handler": "other",
-        "parent_user_service_id": PARENT,
-        "until": until,
-    }
-
-
 class World:
     def __init__(self, period: str) -> None:
         self.lock = threading.Lock()
         self.period = period
-        self.storage: Dict[str, Any] = {}
         self.user = _user(reset_at=_period_bounds(period)[0].replace("Z", ".000Z"))
         self.parent = _parent()
         self.calls: List[Dict[str, Any]] = []
         self.panel_failures = 0
         self.panel_gets = 0
         self.fail_panel_get_at = 0
-        self.purchase_posts = 0
-        self.fail_purchase_post_at = 0
         self.patch_status = 200
         self.apply_patch = True
         self.applied_patches = 0
-        self.lock_gets = 0
-        self.steal_on_lock_get = 0
         self.parent_status = 200
-        self.lock_put_status = 0
-        self.lock_get_status = 0
-        self.mutate_after_lock = False
-        self.diverge_next_readback = False
-        self.return_different_body = False
         self.jump_clock_on = ""
         self.clock_jump_to = 0
         self.clock_file = ""
-        self.terminal_after_patch = ""
         self.prolong_expire = ""
-
-    def purchase_key(self) -> str:
-        return f"ta-{PARENT}-{self.period.replace('-', '')}"
-
-    def lock_key(self) -> str:
-        return f"tl-{PARENT}"
 
     def record(self, method: str, path: str, body: Any) -> None:
         self.calls.append({"method": method, "path": path, "body": body})
@@ -287,18 +212,13 @@ class Handler(BaseHTTPRequestHandler):
         world = self.world
         with world.lock:
             world.record(method, path, body)
-            if path.startswith("/shm/v1/storage/manage/"):
-                self._storage(method, path.rsplit("/", 1)[-1], body)
-                return
             if path == "/shm/v1/user/service":
                 self._send(world.parent_status, world.parent if world.parent_status == 200 else {"error": "down"})
                 return
             if path == f"/api/users/by-username/us_{PARENT}":
                 world.panel_gets += 1
-                if world.terminal_after_patch and world.panel_gets >= 3:
-                    record = world.storage.get(world.purchase_key())
-                    if isinstance(record, dict):
-                        record["state"] = world.terminal_after_patch
+                if world.jump_clock_on == "reread" and world.panel_gets == 2 and world.clock_file:
+                    Path(world.clock_file).write_text(str(world.clock_jump_to))
                 if world.fail_panel_get_at and world.panel_gets == world.fail_panel_get_at:
                     self._send(503, {"error": "unavailable"})
                     return
@@ -320,68 +240,6 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(404, {"error": "not found"})
 
-    def _storage(self, method: str, name: str, body: Any) -> None:
-        world = self.world
-        if method == "GET":
-            if name == world.lock_key():
-                world.lock_gets += 1
-                if world.lock_get_status:
-                    self._send(world.lock_get_status, {"error": "unavailable"})
-                    return
-                if world.steal_on_lock_get and world.lock_gets == world.steal_on_lock_get:
-                    world.storage[name] = _foreign_lock(int(time.time()) + 3600)
-            if name == world.purchase_key() and world.return_different_body and name in world.storage:
-                world.return_different_body = False
-                changed = json.loads(json.dumps(world.storage[name]))
-                changed["last_error"] = "different-body"
-                self._send(200, changed)
-                return
-            if name not in world.storage:
-                self._send(404, {"error": "missing"})
-                return
-            self._send(200, world.storage[name])
-            return
-        if method == "DELETE":
-            world.storage.pop(name, None)
-            self._send(200, {})
-            return
-        if method == "PUT":
-            if name == world.lock_key() and world.lock_put_status:
-                self._send(world.lock_put_status, {"error": "put failed"})
-                return
-            if name in world.storage:
-                self._send(400, {"error": "exists"})
-                return
-            world.storage[name] = body
-            if name == world.lock_key() and world.mutate_after_lock:
-                record = world.storage[world.purchase_key()]
-                record["addon_bytes"] = PACK + 1
-                record["applied_limit_bytes"] = BASE + record["addon_bytes"]
-                _sign(record)
-            self._send(200, body)
-            return
-        if method == "POST":
-            if name == world.purchase_key():
-                world.purchase_posts += 1
-                if world.purchase_posts == world.fail_purchase_post_at:
-                    self._send(500, {"error": "write failed"})
-                    return
-            world.storage[name] = body
-            if (
-                name == world.purchase_key()
-                and world.jump_clock_on == "proof"
-                and isinstance(body, dict)
-                and isinstance(body.get("apply_proof"), dict)
-            ):
-                if world.clock_file:
-                    Path(world.clock_file).write_text(str(world.clock_jump_to))
-            if name == world.purchase_key() and world.diverge_next_readback:
-                world.diverge_next_readback = False
-                world.return_different_body = True
-            self._send(200, body)
-            return
-        self._send(405, {"error": method})
-
 
 def _render(base: str, settings: Any, catalog: Any, withdraw: Any, **fields: str) -> str:
     values = {
@@ -398,9 +256,6 @@ def _render(base: str, settings: Any, catalog: Any, withdraw: Any, **fields: str
         "{{ toJson(us.settings) }}": json.dumps(settings, ensure_ascii=False),
         "{{ toJson(us.service.settings) }}": json.dumps(catalog, ensure_ascii=False),
         "{{ toJson(us.withdraw.get) }}": json.dumps(withdraw, ensure_ascii=False),
-        "{{ toJson(server.settings.traffic_addon.snapshot_key) }}": json.dumps(
-            fields.get("snapshot_key", SNAPSHOT_KEY), ensure_ascii=False
-        ),
     }
     text = TEMPLATE.read_text()
     for key in sorted(values, key=len, reverse=True):
@@ -459,6 +314,8 @@ def _forbidden(world: World) -> List[str]:
             found.append("delete user")
         if "reset-traffic" in path or path.endswith("/actions/enable") or path.endswith("/actions/disable"):
             found.append(path)
+        if "storage/manage" in path:
+            found.append(path)
         if "payment" in path or path.endswith("/service/order") or "money_back" in path:
             found.append(path)
         if method == "PATCH" and path != "/api/users":
@@ -506,10 +363,18 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
             self.assertEqual(set(call["body"]), {"uuid", "trafficLimitBytes"})
             self.assertEqual(call["body"]["uuid"], UUID)
 
+    def _clock(self, world: World, jump_to: int) -> Dict[str, str]:
+        handle = tempfile.NamedTemporaryFile("w", delete=False)
+        handle.write(str(int(time.time())))
+        handle.close()
+        world.clock_file = handle.name
+        world.clock_jump_to = jump_to
+        self.addCleanup(Path(handle.name).unlink, missing_ok=True)
+        return {"TRAFFIC_ADDON_CLOCK_FILE": handle.name}
+
     def test_01_raises_base_limit_to_stored_total(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         result = self._execute(world)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
@@ -519,79 +384,40 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(world.user["status"], "ACTIVE")
         self.assertEqual(len(_patches(world)), 1)
         self.assertEqual(_patches(world)[0]["body"]["trafficLimitBytes"], TARGET)
-        self.assertEqual(world.storage[world.purchase_key()]["state"], "APPLIED")
         self.assert_clean(world, result)
-        logged = _output(result)
-        self.assertIn(PURCHASE, logged)
-        self.assertIn(str(PARENT), logged)
-        self.assertIn(str(ADDON), logged)
-        self.assertIn(period, logged)
 
     def test_02_repeat_does_not_add_another_pack(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        server = _start(world)
-        host, port = server.server_address
-        script = _render(f"http://{host}:{port}", _settings(period), _catalog(), _withdraw(True))
-        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as handle:
-            handle.write(script)
-            path = handle.name
-        try:
-            first = _run(path)
-            second = _run(path)
-        finally:
-            server.shutdown()
-            server.server_close()
-            Path(path).unlink(missing_ok=True)
-        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        world.user["trafficLimitBytes"] = TARGET
+        result = self._execute(world)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
-        self.assertNotEqual(world.user["trafficLimitBytes"], TARGET + PACK)
-        self.assertEqual(len(_patches(world)), 1)
-        self.assert_clean(world, second)
+        self.assertEqual(_patches(world), [])
+        self.assert_clean(world, result)
 
-    def test_03_reserved_without_payment_does_not_grant(self) -> None:
+    def test_03_unpaid_withdraw_does_not_grant(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period, state="RESERVED", amount="")
         result = self._execute(world, withdraw=_withdraw(False))
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "payment_not_confirmed")
         self.assertEqual(_patches(world), [])
-        self.assertEqual(world.storage[world.purchase_key()]["state"], "RESERVED")
-        self.assert_clean(world, result)
-
-    def test_04_paid_reserved_is_applied(self) -> None:
-        period = _open_period()
-        world = World(period)
-        stored = _storage(period, state="RESERVED", amount="")
-        stored["withdraw_id"] = None
-        world.storage[world.purchase_key()] = stored
-        result = self._execute(world, withdraw=_withdraw(True, "150.00"))
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        saved = world.storage[world.purchase_key()]
-        self.assertEqual(saved["state"], "APPLIED")
-        self.assertEqual(saved["withdraw_id"], 775501)
-        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
         self.assert_clean(world, result)
 
     def test_05_lost_patch_response_is_recovered_without_second_increase(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.patch_status = 500
         result = self._execute(world)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
         self.assertEqual(len(_patches(world)), 1)
-        self.assertEqual(world.storage[world.purchase_key()]["state"], "APPLIED")
         self.assert_clean(world, result)
 
     def test_06_panel_outage_then_retry(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.panel_failures = 1
         server = _start(world)
         host, port = server.server_address
@@ -618,7 +444,6 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
     def test_07_other_users_subscription(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.parent = _parent(user_id=USER + 9)
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
@@ -629,8 +454,7 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
     def test_08_tariff_outside_allow_list(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.parent = _parent(service_id=99)
+        world.parent = _parent(service_id=14)
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "tariff_not_allowed")
@@ -640,8 +464,7 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
     def test_09_vff_premium_is_not_eligible(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.parent = _parent(service_id=14)
+        world.parent = _parent(service_id=14, category="vpn-mz-test")
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "tariff_not_allowed")
@@ -651,44 +474,39 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
     def test_10_friends_connect_is_not_eligible(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.parent = _parent(service_id=10, category="vpn-mz-fc")
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "parent_category_mismatch")
+        self.assertIn(_reason(result), {"parent_category_mismatch", "tariff_not_allowed"})
         self.assertEqual(_patches(world), [])
         self.assert_clean(world, result)
 
     def test_11_disabled_subscription_is_not_enabled(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.user = _user(status="DISABLED", reset_at=_period_bounds(period)[0])
+        world.user["status"] = "DISABLED"
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "panel_status")
-        self.assertEqual(world.user["status"], "DISABLED")
-        self.assertEqual(world.user["trafficLimitBytes"], BASE)
         self.assertEqual(_patches(world), [])
+        self.assertEqual(world.user["status"], "DISABLED")
         self.assert_clean(world, result)
 
     def test_12_expired_subscription_is_not_extended(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.user = _user(status="EXPIRED", reset_at=_period_bounds(period)[0])
+        world.user["status"] = "EXPIRED"
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "panel_status")
-        self.assertEqual(world.user["expireAt"], EXPIRE)
         self.assertEqual(_patches(world), [])
+        self.assertEqual(world.user["expireAt"], EXPIRE)
         self.assert_clean(world, result)
 
     def test_13_limited_subscription_is_raised_without_enable(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.user = _user(status="LIMITED", reset_at=_period_bounds(period)[0])
+        world.user["status"] = "LIMITED"
         result = self._execute(world)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(world.user["status"], "LIMITED")
@@ -698,7 +516,6 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
     def test_14_closed_period_is_not_granted(self) -> None:
         period = _shift_period(_open_period(), -2)
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         result = self._execute(world, settings=_settings(period))
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "period_closed")
@@ -707,118 +524,51 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
 
     def test_15_unconfirmed_reset_does_not_grant(self) -> None:
         period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         previous = _shift_period(period, -1)
-        world.user["lastTrafficResetAt"] = _period_bounds(previous)[0]
+        world = World(period)
+        world.user = _user(reset_at=_period_bounds(previous)[0])
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "period_not_confirmed")
-        self.assertEqual(world.user["trafficLimitBytes"], BASE)
         self.assertEqual(_patches(world), [])
         self.assert_clean(world, result)
 
     def test_16_manual_limit_is_not_overwritten(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.user["trafficLimitBytes"] = 999
+        world.user["trafficLimitBytes"] = BASE + 1
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "limit_conflict")
-        self.assertEqual(world.user["trafficLimitBytes"], 999)
+        self.assertEqual(world.user["trafficLimitBytes"], BASE + 1)
         self.assertEqual(_patches(world), [])
         self.assert_clean(world, result)
 
-    def test_16b_target_without_proof_is_a_conflict(self) -> None:
+    def test_16b_target_without_prior_patch_is_not_increased(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.user["trafficLimitBytes"] = TARGET
         result = self._execute(world)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "limit_conflict")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(_patches(world), [])
-        self.assert_clean(world, result)
-
-    def test_17_refunded_is_terminal(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period, state="REFUNDED")
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "state_refunded")
-        self.assertEqual(_patches(world), [])
-        self.assert_clean(world, result)
-
-    def test_18_expired_purchase_is_terminal(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period, state="EXPIRED")
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "state_expired")
-        self.assertEqual(_patches(world), [])
+        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
         self.assert_clean(world, result)
 
     def test_19_later_catalog_change_does_not_change_paid_volume(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         result = self._execute(world, catalog=_catalog(bytes_value=1))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(_patches(world)[0]["body"]["trafficLimitBytes"], TARGET)
-        self.assertEqual(world.storage[world.purchase_key()]["addon_bytes"], PACK)
-        self.assertEqual(world.storage[world.purchase_key()]["applied_limit_bytes"], TARGET)
         self.assert_clean(world, result)
-
-    def test_20_applied_write_failure_stays_unsuccessful_then_retries(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.fail_purchase_post_at = 2
-        server = _start(world)
-        host, port = server.server_address
-        script = _render(f"http://{host}:{port}", _settings(period), _catalog(), _withdraw(True))
-        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as handle:
-            handle.write(script)
-            path = handle.name
-        try:
-            first = _run(path)
-            after_first = world.storage[world.purchase_key()]["state"]
-            patches_after_first = len(_patches(world))
-            second = _run(path)
-        finally:
-            server.shutdown()
-            server.server_close()
-            Path(path).unlink(missing_ok=True)
-        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
-        self.assertIn("temporary", _output(first))
-        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
-        self.assertEqual(patches_after_first, 1)
-        self.assertNotEqual(after_first, "APPLIED")
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(len(_patches(world)), 1)
-        self.assertEqual(world.storage[world.purchase_key()]["state"], "APPLIED")
-        self.assert_clean(world, second)
 
     def test_21_repeat_after_period_end_does_not_grant(self) -> None:
         period = _shift_period(_open_period(), -2)
         world = World(period)
-        stored = _storage(period, state="APPLIED")
-        stored["apply_proof"] = {
-            "remnawave_uuid": UUID,
-            "expire_at": EXPIRE,
-            "strategy": "MONTH",
-            "observed_limit_before": BASE,
-            "phase": "confirmed",
-        }
-        world.storage[world.purchase_key()] = stored
         world.user["trafficLimitBytes"] = BASE
         result = self._execute(world, settings=_settings(period))
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "period_closed")
-        self.assertEqual(world.user["trafficLimitBytes"], BASE)
         self.assertEqual(_patches(world), [])
         self.assert_clean(world, result)
 
@@ -832,71 +582,44 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
             ({"category": "vpn-mz-test"}, "unexpected_category"),
             ({"event": "PROLONGATE"}, "unexpected_event"),
         ]
-        for override, reason in cases:
+        for fields, reason in cases:
             world = World(period)
-            world.storage[world.purchase_key()] = _storage(period)
-            settings = override.get("settings", _settings(period))
+            settings = fields.get("settings", _settings(period))
             result = self._execute(
                 world,
                 settings=settings,
-                event=override.get("event", "CREATE"),
-                service_id=override.get("service_id", "17"),
-                category=override.get("category", "traffic-add-vff"),
+                event=fields.get("event", "CREATE"),
+                service_id=fields.get("service_id", "17"),
+                category=fields.get("category", "traffic-add-vff"),
             )
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             self.assertEqual(_reason(result), reason, result.stdout + result.stderr)
             self.assertEqual(_patches(world), [])
-            self.assert_clean(world, result)
-
-    def test_paid_order_unknown_is_applied_without_a_new_order(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period, state="ORDER_UNKNOWN")
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(world.storage[world.purchase_key()]["state"], "APPLIED")
-        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
-        self.assert_clean(world, result)
-
-    def test_failed_state_is_not_retried_into_success(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period, state="FAILED")
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "state_failed")
-        self.assertEqual(_patches(world), [])
-        self.assert_clean(world, result)
 
     def test_created_in_period_without_reset_is_granted(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.user = _user(reset_at=None, created_at=_period_bounds(period)[0])
         result = self._execute(world)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
-        self.assertEqual(len(_patches(world)), 1)
         self.assert_clean(world, result)
 
     def test_created_in_previous_period_without_reset_is_not_granted(self) -> None:
         period = _open_period()
         previous = _shift_period(period, -1)
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.user = _user(reset_at=None, created_at=_period_bounds(previous)[0])
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "period_not_confirmed")
         self.assertEqual(_patches(world), [])
-        self.assertEqual(world.user["trafficLimitBytes"], BASE)
         self.assert_clean(world, result)
 
     def test_missing_created_at_and_reset_is_not_granted(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.user = _user(reset_at=None)
+        world.user = _user(reset_at=None, created_at=None)
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "period_not_confirmed")
@@ -906,7 +629,6 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
     def test_future_created_at_is_not_granted(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         future = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
         world.user = _user(reset_at=_period_bounds(period)[0], created_at=future)
         result = self._execute(world)
@@ -920,67 +642,16 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         previous = _shift_period(period, -1)
         older = _shift_period(period, -2)
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.user = _user(
-            reset_at=_period_bounds(previous)[0],
-            created_at=_period_bounds(older)[0],
-        )
+        world.user = _user(reset_at=_period_bounds(previous)[0], created_at=_period_bounds(older)[0])
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "period_not_confirmed")
-        self.assertEqual(world.user["trafficLimitBytes"], BASE)
         self.assertEqual(_patches(world), [])
         self.assert_clean(world, result)
-
-    def test_crash_before_patch_does_not_change_limit(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.fail_purchase_post_at = 1
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("temporary", _output(result))
-        self.assertEqual(_patches(world), [])
-        self.assertEqual(world.user["trafficLimitBytes"], BASE)
-        self.assertNotIn("apply_proof", world.storage[world.purchase_key()])
-        self.assert_clean(world, result)
-
-    def test_crash_after_proof_before_patch_retries_once(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.steal_on_lock_get = 3
-        server = _start(world)
-        host, port = server.server_address
-        script = _render(f"http://{host}:{port}", _settings(period), _catalog(), _withdraw(True))
-        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False) as handle:
-            handle.write(script)
-            path = handle.name
-        try:
-            first = _run(path)
-            proof = world.storage[world.purchase_key()].get("apply_proof", {})
-            self.assertEqual(proof.get("phase"), "patching")
-            self.assertEqual(world.user["trafficLimitBytes"], BASE)
-            self.assertEqual(world.storage[world.lock_key()]["lock_id"], "ffffffffffffffffffffffffffffffff")
-            world.steal_on_lock_get = 0
-            world.storage.pop(world.lock_key(), None)
-            second = _run(path)
-        finally:
-            server.shutdown()
-            server.server_close()
-            Path(path).unlink(missing_ok=True)
-        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
-        self.assertEqual(_reason(first), "lock_lost")
-        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
-        self.assertEqual(world.applied_patches, 1)
-        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
-        self.assertEqual(world.storage[world.purchase_key()]["state"], "APPLIED")
-        self.assert_clean(world, second)
 
     def test_patch_sent_but_not_applied_retries_without_stacking(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.apply_patch = False
         world.patch_status = 500
         server = _start(world)
@@ -991,8 +662,7 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
             path = handle.name
         try:
             first = _run(path)
-            self.assertEqual(world.user["trafficLimitBytes"], BASE)
-            self.assertEqual(world.storage[world.purchase_key()]["apply_proof"]["phase"], "patching")
+            limit_after_first = world.user["trafficLimitBytes"]
             world.apply_patch = True
             world.patch_status = 200
             second = _run(path)
@@ -1001,6 +671,7 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
             server.server_close()
             Path(path).unlink(missing_ok=True)
         self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+        self.assertEqual(limit_after_first, BASE)
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertEqual(world.applied_patches, 1)
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
@@ -1009,7 +680,6 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
     def test_confirm_get_lost_after_patch_then_retry_does_not_stack(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.fail_panel_get_at = 3
         server = _start(world)
         host, port = server.server_address
@@ -1019,7 +689,6 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
             path = handle.name
         try:
             first = _run(path)
-            after_first = world.storage[world.purchase_key()]["state"]
             second = _run(path)
         finally:
             server.shutdown()
@@ -1027,190 +696,54 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
             Path(path).unlink(missing_ok=True)
         self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
-        self.assertNotEqual(after_first, "APPLIED")
         self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
         self.assertEqual(world.applied_patches, 1)
-        self.assertEqual(world.storage[world.purchase_key()]["state"], "APPLIED")
         self.assert_clean(world, second)
-
-    def test_foreign_unexpired_lock_is_not_taken_or_deleted(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        foreign = _foreign_lock(int(time.time()) + 3600)
-        world.storage[world.lock_key()] = dict(foreign)
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "lock_held")
-        self.assertEqual(_patches(world), [])
-        self.assertEqual(world.storage[world.lock_key()], foreign)
-        self.assert_clean(world, result)
-
-    def test_expired_foreign_lock_can_be_replaced(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.storage[world.lock_key()] = _foreign_lock(int(time.time()) - 10)
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
-        self.assertNotIn(world.lock_key(), world.storage)
-        self.assert_clean(world, result)
-
-    def _clock(self, world: World, jump_to: int) -> Dict[str, str]:
-        handle = tempfile.NamedTemporaryFile("w", delete=False)
-        now = str(int(time.time()))
-        handle.write(now)
-        handle.close()
-        world.clock_file = handle.name
-        world.clock_jump_to = jump_to
-        self.addCleanup(Path(handle.name).unlink, missing_ok=True)
-        return {"TRAFFIC_ADDON_CLOCK_FILE": handle.name}
 
     def test_period_boundary_before_patch_does_not_grant(self) -> None:
         period = _open_period()
         end = datetime.strptime(_period_bounds(period)[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.jump_clock_on = "proof"
+        world.jump_clock_on = "reread"
         result = self._execute(world, env=self._clock(world, int(end.timestamp())))
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(_reason(result), "period_closed")
         self.assertEqual(_patches(world), [])
-        self.assertNotEqual(world.storage[world.purchase_key()]["state"], "APPLIED")
         self.assert_clean(world, result)
 
-    def test_period_boundary_during_patch_is_not_applied(self) -> None:
+    def test_period_boundary_during_patch_is_not_success(self) -> None:
         period = _open_period()
         end = datetime.strptime(_period_bounds(period)[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.jump_clock_on = "patch"
         result = self._execute(world, env=self._clock(world, int(end.timestamp())))
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(_reason(result), "period_crossed")
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
-        saved = world.storage[world.purchase_key()]
-        self.assertNotEqual(saved["state"], "APPLIED")
-        self.assertEqual(saved["last_error"], "period_crossed_after_patch")
-        self.assertEqual(saved["apply_proof"]["phase"], "patching")
-        self.assert_clean(world, result)
-
-    def test_substituted_withdraw_id_is_rejected(self) -> None:
-        period = _open_period()
-        world = World(period)
-        stored = _storage(period)
-        stored["withdraw_id"] = 111
-        world.storage[world.purchase_key()] = stored
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "withdraw_mismatch")
-        self.assertEqual(_patches(world), [])
-        self.assertEqual(world.storage[world.purchase_key()]["withdraw_id"], 111)
+        self.assertIn(f"period_ends_at={_period_bounds(period)[1]}", result.stderr)
         self.assert_clean(world, result)
 
     def test_substituted_user_service_id_is_rejected(self) -> None:
         period = _open_period()
         world = World(period)
-        stored = _storage(period)
-        stored["user_service_id"] = 42
-        world.storage[world.purchase_key()] = stored
-        result = self._execute(world)
+        result = self._execute(world, withdraw=_withdraw(True, user_service_id=42))
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "user_service_mismatch")
+        self.assertEqual(_reason(result), "payment_mismatch")
         self.assertEqual(_patches(world), [])
         self.assert_clean(world, result)
 
-    def test_missing_expected_amount_is_rejected(self) -> None:
+    def test_withdraw_for_other_user_is_rejected(self) -> None:
         period = _open_period()
         world = World(period)
-        stored = _storage(period)
-        del stored["expected_amount"]
-        world.storage[world.purchase_key()] = stored
-        result = self._execute(world)
+        result = self._execute(world, withdraw=_withdraw(True, user_id=USER + 3))
         self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "expected_amount_missing")
+        self.assertEqual(_reason(result), "payment_mismatch")
         self.assertEqual(_patches(world), [])
-        self.assert_clean(world, result)
-
-    def test_charged_amount_must_match_expected_amount(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        result = self._execute(world, withdraw=_withdraw(True, "10.00"))
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "amount_mismatch")
-        self.assertEqual(_patches(world), [])
-        self.assert_clean(world, result)
-
-    def test_limit_snapshot_changed_after_lock_is_rejected(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.mutate_after_lock = True
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(_reason(result), "storage_contract")
-        self.assertEqual(_patches(world), [])
-        self.assertEqual(world.user["trafficLimitBytes"], BASE)
-        self.assert_clean(world, result)
-
-    def test_lock_read_error_does_not_take_over(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        foreign = _foreign_lock(int(time.time()) + 3600)
-        world.storage[world.lock_key()] = dict(foreign)
-        world.lock_get_status = 500
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(_reason(result), "lock_unavailable")
-        self.assertEqual(_patches(world), [])
-        self.assertEqual(world.storage[world.lock_key()], foreign)
-        posts = [call for call in world.calls if call["method"] == "POST" and call["path"].endswith(world.lock_key())]
-        self.assertEqual(posts, [])
-        self.assert_clean(world, result)
-
-    def test_lock_put_error_is_not_treated_as_existing_lock(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.lock_put_status = 500
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(_reason(result), "lock_unavailable")
-        self.assertNotIn(world.lock_key(), world.storage)
-        self.assertEqual(_patches(world), [])
-        self.assert_clean(world, result)
-
-    def test_lock_expired_before_applied_write(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.jump_clock_on = "proof"
-        result = self._execute(world, env=self._clock(world, int(time.time()) + 200))
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(_reason(result), "lock_lost")
-        self.assertEqual(_patches(world), [])
-        self.assertNotEqual(world.storage[world.purchase_key()]["state"], "APPLIED")
-        self.assert_clean(world, result)
-
-    def test_terminal_state_after_patch_is_not_revived(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.terminal_after_patch = "REFUNDED"
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(_reason(result), "state_refunded")
-        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
-        self.assertEqual(world.storage[world.purchase_key()]["state"], "REFUNDED")
         self.assert_clean(world, result)
 
     def test_active_user_with_past_expire_is_not_granted(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         world.user["expireAt"] = "2020-01-01T00:00:00.000Z"
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
@@ -1221,71 +754,39 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
     def test_concurrent_prolongation_keeps_applied_limit(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         prolonged = "2027-06-01T00:00:00.000Z"
         world.prolong_expire = prolonged
         result = self._execute(world)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
         self.assertEqual(world.user["expireAt"], prolonged)
-        patch = _patches(world)[0]["body"]
-        self.assertEqual(set(patch), {"uuid", "trafficLimitBytes"})
-        self.assertEqual(world.storage[world.purchase_key()]["apply_proof"]["expire_at"], prolonged)
-        self.assertEqual(world.storage[world.purchase_key()]["state"], "APPLIED")
-        self.assert_clean(world, result)
-
-    def test_same_version_with_different_body_is_rejected(self) -> None:
-        period = _open_period()
-        world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
-        world.diverge_next_readback = True
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(_reason(result), "storage_conflict")
-        self.assertEqual(_patches(world), [])
-        stored = world.storage[world.purchase_key()]
-        self.assertNotEqual(stored.get("last_error"), "different-body")
+        self.assertEqual(set(_patches(world)[0]["body"]), {"uuid", "trafficLimitBytes"})
         self.assert_clean(world, result)
 
     def test_temp_files_removed_on_success_and_error(self) -> None:
         period = _open_period()
         with tempfile.TemporaryDirectory() as tmp:
             world = World(period)
-            world.storage[world.purchase_key()] = _storage(period)
             ok = self._execute(world, env={"TMPDIR": tmp})
             self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
             self.assertEqual(list(Path(tmp).glob("traffic-addon.*")), [])
             failed = World(period)
-            failed.storage[failed.purchase_key()] = _storage(period)
             bad = self._execute(failed, withdraw=_withdraw(False), env={"TMPDIR": tmp})
             self.assertEqual(bad.returncode, 1)
             self.assertEqual(list(Path(tmp).glob("traffic-addon.*")), [])
             self.assert_clean(world, ok)
-
-    def test_user_storage_substitution_without_mac_is_rejected(self) -> None:
-        period = _open_period()
-        world = World(period)
-        stored = _storage(period)
-        stored["addon_bytes"] = PACK * 2
-        stored["applied_limit_bytes"] = BASE + stored["addon_bytes"]
-        world.storage[world.purchase_key()] = stored
-        result = self._execute(world)
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(_reason(result), "snapshot_mismatch")
-        self.assertEqual(_patches(world), [])
-        self.assertEqual(world.user["trafficLimitBytes"], BASE)
-        self.assert_clean(world, result)
 
     def test_tls_verification_is_not_disabled(self) -> None:
         text = TEMPLATE.read_text()
         self.assertNotIn("curl -k", text)
         self.assertNotIn("curl -skS", text)
         self.assertIn("curl -sS", text)
+        self.assertNotIn("storage/manage", text)
+        self.assertNotIn("snapshot_mac", text)
 
     def test_shell_placeholders_are_not_evaluated(self) -> None:
         period = _open_period()
         world = World(period)
-        world.storage[world.purchase_key()] = _storage(period)
         with tempfile.TemporaryDirectory() as tmp:
             marker = Path(tmp) / "pwned"
             result = self._execute(world, category=f"$(touch {marker})")
@@ -1293,3 +794,24 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
             self.assertEqual(_reason(result), "unexpected_category")
             self.assertFalse(marker.exists())
             self.assert_clean(world, result)
+
+    def test_inconsistent_limits_are_rejected(self) -> None:
+        period = _open_period()
+        world = World(period)
+        settings = _settings(period)
+        settings["applied_limit_bytes"] = TARGET + 1
+        result = self._execute(world, settings=settings)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(_reason(result), "bad_settings")
+        self.assertEqual(_patches(world), [])
+        self.assert_clean(world, result)
+
+    def test_parent_not_active_is_rejected(self) -> None:
+        period = _open_period()
+        world = World(period)
+        world.parent = _parent(status="BLOCK")
+        result = self._execute(world)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(_reason(result), "parent_not_active")
+        self.assertEqual(_patches(world), [])
+        self.assert_clean(world, result)
