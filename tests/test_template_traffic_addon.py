@@ -36,6 +36,7 @@ UUID = "11111111-1111-4111-8111-111111111111"
 EXPIRE = "2026-12-15T00:00:00.000Z"
 TOKEN = "test-token-must-not-appear"
 _UNSET = object()
+_NULL = object()
 
 
 def _period_bounds(period: str) -> tuple[str, str]:
@@ -314,7 +315,7 @@ def _render(
         "{{ toJson(us.service.category) }}": json.dumps(fields.get("category", "traffic-add-vff"), ensure_ascii=False),
         "{{ toJson(us.service.cost) }}": json.dumps(fields.get("cost", "150.00"), ensure_ascii=False),
         "{{ toJson(us.settings) }}": json.dumps(settings, ensure_ascii=False),
-        "{{ toJson(us.service.settings) }}": json.dumps(catalog, ensure_ascii=False),
+        "{{ toJson(us.service.settings) }}": "null" if catalog is _NULL else json.dumps(catalog, ensure_ascii=False),
         "{{ toJson(us.withdraw.get) }}": json.dumps(withdraw, ensure_ascii=False),
     }
     text = TEMPLATE.read_text()
@@ -1101,3 +1102,103 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "panel_unavailable")
         self.assertEqual(_patches(world), [])
+
+    def test_remove_ignores_disabled_catalog(self) -> None:
+        period = "2026-11"
+        _, end = _period_bounds(period)
+        world = World(period)
+        world.user["trafficLimitBytes"] = TARGET
+        world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+        result = self._remove(world, _stamp_epoch(end) + 60, catalog=_NULL)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "restored")
+        self.assertEqual(world.user["trafficLimitBytes"], BASE)
+        create = World(period)
+        refused = self._execute(create, catalog=_NULL)
+        self.assertEqual(refused.returncode, 1)
+        self.assertEqual(_reason(refused), "unsupported_catalog")
+        self.assertEqual(_patches(create), [])
+
+    def test_remove_retries_when_another_pack_cannot_be_excluded(self) -> None:
+        period = "2026-11"
+        _, end = _period_bounds(period)
+        epoch = _stamp_epoch(end) + 60
+        newer, money = _grant("2026-12", "ACTIVE")
+        broken = dict(newer)
+        broken["settings"] = "not-an-object"
+        cases = (
+            [broken],
+            [money],
+            [newer, "bad-element"],
+            {"row": newer, "junk": "x"},
+        )
+        for services in cases:
+            world = World(period)
+            world.user["trafficLimitBytes"] = TARGET
+            world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+            result = self._remove(world, epoch, services=services, withdraws=[money])
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(_reason(result), "history_unreadable")
+            self.assertEqual(_patches(world), [])
+            self.assertEqual(world.user["trafficLimitBytes"], TARGET)
+        mismatch = dict(money)
+        mismatch["total"] = "10.00"
+        world = World(period)
+        world.user["trafficLimitBytes"] = TARGET
+        world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+        result = self._remove(world, epoch, services=[newer], withdraws=[mismatch])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "history_unreadable")
+        self.assertEqual(_patches(world), [])
+        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
+
+    def test_remove_without_confirmed_parent_does_not_patch(self) -> None:
+        period = "2026-11"
+        _, end = _period_bounds(period)
+        epoch = _stamp_epoch(end) + 60
+        world = World(period)
+        world.parent_status = 404
+        world.user["trafficLimitBytes"] = TARGET
+        world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+        result = self._remove(world, epoch)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "parent_unconfirmed")
+        self.assertEqual(_patches(world), [])
+        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
+
+        world = World(period)
+        world.parent = {"data": []}
+        world.user["trafficLimitBytes"] = TARGET
+        world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+        result = self._remove(world, epoch)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "parent_unconfirmed")
+        self.assertEqual(_patches(world), [])
+
+        world = World(period)
+        world.parent = {"data": []}
+        world.panel_missing = True
+        world.user["trafficLimitBytes"] = TARGET
+        result = self._remove(world, epoch)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "parent_absent")
+        self.assertEqual(_patches(world), [])
+
+        world = World(period)
+        world.parent = _parent(status="REMOVED")
+        world.panel_missing = True
+        world.user["trafficLimitBytes"] = TARGET
+        result = self._remove(world, epoch)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "parent_absent")
+        self.assertEqual(_patches(world), [])
+
+        world = World(period)
+        world.parent = _parent(status="REMOVED")
+        world.user["trafficLimitBytes"] = TARGET
+        world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+        result = self._remove(world, epoch)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "restored")
+        self.assertEqual(world.user["trafficLimitBytes"], BASE)
+        self.assertEqual(len(_patches(world)), 1)

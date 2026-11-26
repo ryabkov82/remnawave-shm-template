@@ -390,9 +390,11 @@ _other_live_pack() {
   jq -n -r --arg self "${ADDON_US_ID}" --arg parent "${PARENT_US_ID}" --arg user "${ADDON_USER_ID}" --arg now "${now_iso}" --argjson rows "${rows}" --argjson withdraws "${withdraws}" '
     def as_rows:
       if . == null then error("unreadable")
-      elif type == "array" then .
+      elif type == "array" then
+        if any(.[]; type != "object") then error("unreadable") else . end
       elif type == "object" and (.user_service_id != null or .withdraw_id != null) then [.]
-      elif type == "object" then [.[] | select(type == "object")]
+      elif type == "object" then
+        if any(.[]; type != "object") then error("unreadable") else [.[]] end
       else error("unreadable") end;
     def cents:
       (if type == "number" then tostring elif type == "string" then . else "" end) as $t
@@ -400,31 +402,49 @@ _other_live_pack() {
           $t | capture("^(?<w>[0-9]+)(?:\\.(?<f>[0-9]{1,2}))?$") as $p
           | ($p.w | tonumber) * 100 + ((($p.f // "") + "00")[0:2] | tonumber)
         else -1 end;
+    def dated: (.withdraw_date | type) == "string" and (.withdraw_date | length) > 0;
+    def paid_match($expected):
+      dated
+      and (.withdraw_id | type) == "number" and .withdraw_id > 0
+      and (.user_id | tostring) == $user
+      and (.service_id | tostring) == "17"
+      and (.total | cents) == $expected;
     ($rows | as_rows) as $list
     | ($withdraws | as_rows) as $paid
     | reduce $list[] as $row ("clear";
         if . == "block" then .
         elif ($row.user_service_id | tostring) == $self then .
-        elif ($row.settings.parent_user_service_id | tostring) != $parent then .
         elif ($row.settings | type) != "object"
           or ($row.settings.period_ends_at | type) != "string"
-          or (($row.settings.expected_amount | cents) <= 0) then error("unreadable")
+          or (($row.settings.expected_amount | cents) <= 0)
+          or (($row.settings.parent_user_service_id | type) != "number" and ($row.settings.parent_user_service_id | type) != "string")
+          or ($row.settings.parent_user_service_id | tostring | length) == 0 then error("unreadable")
+        elif ($row.settings.parent_user_service_id | tostring) != $parent then .
         elif ([($row.status // "") | ascii_upcase] | .[0]) as $status
           | ($status != "ACTIVE" and $status != "REMOVED" and $status != "PROGRESS") then .
         else
           [ $paid[] | select((.user_service_id | tostring) == ($row.user_service_id | tostring)) ] as $mine
-          | if any($mine[]; (.withdraw_date | type) == "string" and (.withdraw_date | length) > 0 and ((.total | cents) <= 0)) then error("unreadable")
-            elif any($mine[];
-              (.withdraw_date | type) == "string" and (.withdraw_date | length) > 0
-              and (.withdraw_id | type) == "number" and .withdraw_id > 0
-              and (.user_id | tostring) == $user
-              and (.service_id | tostring) == "17"
-              and (.total | cents) == ($row.settings.expected_amount | cents)
-            ) and ($row.settings.period_ends_at > $now) then "block"
+          | ($row.settings.expected_amount | cents) as $expected
+          | if any($mine[]; dated and ((.total | cents) <= 0)) then error("unreadable")
+            elif ($row.settings.period_ends_at > $now) and any($mine[]; dated and (paid_match($expected) | not)) then error("unreadable")
+            elif ($row.settings.period_ends_at > $now) and any($mine[]; paid_match($expected)) then "block"
             else . end
         end
       )
   '
+}
+
+_parent_kind() {
+  local file="$1"
+  jq -r --arg parent_id "${PARENT_US_ID}" --arg user "${ADDON_USER_ID}" '
+    if (.data | type) != "array" then "unreadable"
+    elif (.data | length) == 0 then "deleted"
+    elif (.data | length) != 1 then "unreadable"
+    elif ((.data[0].user_service_id | tostring) != $parent_id)
+      or ((.data[0].user_id | tostring) != $user) then "foreign"
+    elif ((.data[0].status // "") | ascii_upcase) == "REMOVED" then "removed"
+    else "owned" end
+  ' "${file}"
 }
 
 _restore_base() {
@@ -469,23 +489,27 @@ _finish_remove() {
     stop_temporary "shm_unavailable"
   fi
   if [[ "${parent_code}" == "200" ]]; then
-    reason="$(jq -r --arg parent_id "${PARENT_US_ID}" --arg user "${ADDON_USER_ID}" '
-      if (.data | type != "array") or (.data | length != 1) then "parent_not_owned"
-      elif (.data[0].user_service_id | tostring) != $parent_id then "parent_not_owned"
-      elif (.data[0].user_id | tostring) != $user then "parent_not_owned"
-      else "ok" end
-    ' "${parent_file}")" || stop_temporary "parent_unreadable"
-    [[ "${reason}" == "ok" ]] || stop_permanent "${reason}"
-  elif [[ "${parent_code}" != "404" ]]; then
+    reason="$(_parent_kind "${parent_file}")" || stop_temporary "parent_unreadable"
+    case "${reason}" in
+      owned|removed|deleted) ;;
+      foreign) stop_permanent "parent_not_owned" ;;
+      *) stop_temporary "parent_unreadable" ;;
+    esac
+  elif [[ "${parent_code}" == "404" ]]; then
+    reason="deleted"
+  else
     stop_temporary "shm_parent_${parent_code}"
   fi
   panel="$(_panel_optional)" || stop_temporary "panel_io"
   if [[ -z "${panel}" ]]; then
-    if [[ "${parent_code}" == "404" ]]; then
+    if [[ "${reason}" == "deleted" || "${reason}" == "removed" ]]; then
       echo "RESULT level=ok reason=parent_absent" >&2
       exit 0
     fi
     stop_temporary "panel_user_missing"
+  fi
+  if [[ "${reason}" == "deleted" ]]; then
+    stop_temporary "parent_unconfirmed"
   fi
   reset_at="$(jq -r 'if (.response.lastTrafficResetAt | type) == "string" then .response.lastTrafficResetAt else "" end' "${panel}")"
   [[ -n "${reset_at}" ]] || stop_temporary "reset_not_confirmed"
@@ -537,20 +561,22 @@ CATALOG_COST="$(_scalar "${_RAW_COST}")" || stop_permanent "bad_catalog_cost"
 [[ "${ADDON_CATEGORY}" == "${EXPECTED_CATEGORY}" ]] || stop_permanent "unexpected_category"
 
 SETTINGS_JSON="$(_json_or_null "${SETTINGS_JSON}")" || stop_permanent "bad_settings"
-CATALOG_JSON="$(_json_or_null "${CATALOG_JSON}")" || stop_permanent "bad_catalog"
 WITHDRAW_JSON="$(_json_or_null "${WITHDRAW_JSON}")" || stop_temporary "withdraw_unreadable"
-jq -e '
-  .traffic_addon.brand == "vff"
-  and .traffic_addon.parent_category == "vpn-mz-test"
-  and (.traffic_addon.parent_service_ids | type == "array" and length > 0)
-  and (.traffic_addon.parent_service_ids | all(type == "number" and . > 0))
-  and (.traffic_addon.bytes | type == "number" and . > 0)
-  and .traffic_addon.strategy == "MONTH"
-  and .traffic_addon.period == "remnawave_monthly_reset"
-  and .traffic_addon.reset_cron == "20 0 1 * *"
-  and .traffic_addon.reset_timezone == "UTC"
-  and .traffic_addon.max_purchases_per_period == 1
-' >/dev/null <<<"${CATALOG_JSON}" || stop_permanent "unsupported_catalog"
+if [[ "${EVENT}" == "CREATE" ]]; then
+  CATALOG_JSON="$(_json_or_null "${CATALOG_JSON}")" || stop_permanent "bad_catalog"
+  jq -e '
+    .traffic_addon.brand == "vff"
+    and .traffic_addon.parent_category == "vpn-mz-test"
+    and (.traffic_addon.parent_service_ids | type == "array" and length > 0)
+    and (.traffic_addon.parent_service_ids | all(type == "number" and . > 0))
+    and (.traffic_addon.bytes | type == "number" and . > 0)
+    and .traffic_addon.strategy == "MONTH"
+    and .traffic_addon.period == "remnawave_monthly_reset"
+    and .traffic_addon.reset_cron == "20 0 1 * *"
+    and .traffic_addon.reset_timezone == "UTC"
+    and .traffic_addon.max_purchases_per_period == 1
+  ' >/dev/null <<<"${CATALOG_JSON}" || stop_permanent "unsupported_catalog"
+fi
 
 PURCHASE_ID="$(jq -r '.purchase_id // empty' <<<"${SETTINGS_JSON}")"
 PARENT_US_ID="$(jq -r '.parent_user_service_id // empty' <<<"${SETTINGS_JSON}")"
