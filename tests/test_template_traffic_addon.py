@@ -94,6 +94,7 @@ def _settings(period: str) -> Dict[str, Any]:
         "base_limit_bytes": BASE,
         "addon_bytes": PACK,
         "applied_limit_bytes": TARGET,
+        "expected_amount": "150.00",
     }
 
 
@@ -165,6 +166,7 @@ class World:
         self.clock_jump_to = 0
         self.clock_file = ""
         self.prolong_expire = ""
+        self.swap_uuid_on_get = 0
 
     def record(self, method: str, path: str, body: Any) -> None:
         self.calls.append({"method": method, "path": path, "body": body})
@@ -221,6 +223,11 @@ class Handler(BaseHTTPRequestHandler):
                     Path(world.clock_file).write_text(str(world.clock_jump_to))
                 if world.fail_panel_get_at and world.panel_gets == world.fail_panel_get_at:
                     self._send(503, {"error": "unavailable"})
+                    return
+                if world.swap_uuid_on_get and world.panel_gets == world.swap_uuid_on_get:
+                    changed = dict(world.user)
+                    changed["uuid"] = "22222222-2222-4222-8222-222222222222"
+                    self._send(200, {"response": changed})
                     return
                 if world.panel_failures > 0:
                     world.panel_failures -= 1
@@ -804,6 +811,65 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "bad_settings")
         self.assertEqual(_patches(world), [])
+        self.assert_clean(world, result)
+
+    def test_confirm_uuid_must_match_patched_user(self) -> None:
+        period = _open_period()
+        world = World(period)
+        world.swap_uuid_on_get = 3
+        result = self._execute(world)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "panel_uuid_mismatch")
+        self.assertIn("level=permanent", result.stderr)
+        self.assertEqual(len(_patches(world)), 1)
+        self.assertEqual(_patches(world)[0]["body"]["uuid"], UUID)
+        self.assert_clean(world, result)
+
+    def test_parent_progress_during_activate_is_temporary(self) -> None:
+        period = _open_period()
+        world = World(period)
+        world.parent = _parent(status="PROGRESS")
+        result = self._execute(world)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "parent_in_progress")
+        self.assertIn("level=temporary", result.stderr)
+        self.assertEqual(_patches(world), [])
+        self.assert_clean(world, result)
+
+    def test_removed_parent_is_not_granted(self) -> None:
+        period = _open_period()
+        world = World(period)
+        world.parent = _parent(status="REMOVED")
+        result = self._execute(world)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "parent_not_active")
+        self.assertIn("level=permanent", result.stderr)
+        self.assertEqual(_patches(world), [])
+        self.assert_clean(world, result)
+
+    def test_paid_total_must_match_expected_amount(self) -> None:
+        period = _open_period()
+        world = World(period)
+        result = self._execute(world, withdraw=_withdraw(True, total="149.00"))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "payment_mismatch")
+        self.assertEqual(_patches(world), [])
+        self.assert_clean(world, result)
+
+    def test_expected_amount_comes_from_settings_not_a_constant(self) -> None:
+        period = _open_period()
+        world = World(period)
+        settings = _settings(period)
+        settings["expected_amount"] = "200.50"
+        result = self._execute(
+            world,
+            settings=settings,
+            withdraw=_withdraw(True, total=200.50),
+            cost="999.00",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
+        self.assertNotIn("150", result.stdout + result.stderr)
         self.assert_clean(world, result)
 
     def test_parent_not_active_is_rejected(self) -> None:

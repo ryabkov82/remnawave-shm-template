@@ -90,6 +90,7 @@ PANEL_FILE=""
 BASE_LIMIT=""
 ADDON_LIMIT=""
 APPLIED_LIMIT=""
+PATCH_UUID=""
 
 log() {
   echo "[$(date -u +'%F %T')] purchase_id=${PURCHASE_ID:-} parent_user_service_id=${PARENT_US_ID:-} addon_user_service_id=${ADDON_US_ID:-} period=${PERIOD:-} stage=${STAGE} $*" >&2
@@ -188,12 +189,17 @@ _require_parent() {
     if (.data | type != "array") or (.data | length != 1) then "parent_not_owned"
     elif (.data[0].user_service_id | tostring) != $parent_id then "parent_not_owned"
     elif (.data[0].user_id | tostring) != $user then "parent_not_owned"
+    elif .data[0].status == "PROGRESS" then "parent_in_progress"
     elif .data[0].status != "ACTIVE" then "parent_not_active"
     elif .data[0].service.category != $cat[0].traffic_addon.parent_category then "parent_category_mismatch"
     elif ((.data[0].service_id | tonumber) as $id | $cat[0].traffic_addon.parent_service_ids | index($id) == null) then "tariff_not_allowed"
     else "ok" end
-  ' "${dest}")"
-  [[ "${reason}" == "ok" ]] || stop_permanent "${reason}"
+  ' "${dest}")" || stop_temporary "parent_unreadable"
+  case "${reason}" in
+    ok) ;;
+    parent_in_progress) stop_temporary "parent_in_progress" ;;
+    *) stop_permanent "${reason}" ;;
+  esac
 }
 
 _panel_file() {
@@ -312,9 +318,17 @@ _note_period_crossed() {
   stop_permanent "period_crossed"
 }
 
+# UUID фиксируется в теле PATCH. Подтверждающее чтение должно вернуть того же пользователя.
+_require_patched_uuid() {
+  [[ -z "${PATCH_UUID}" || "${PANEL_UUID}" == "${PATCH_UUID}" ]] || stop_permanent "panel_uuid_mismatch"
+}
+
 _confirm_and_finish() {
   local panel="$1" patched="$2"
   _load_panel_fields "${panel}"
+  if [[ "${patched}" == "yes" ]]; then
+    _require_patched_uuid
+  fi
   if [[ "$(_period_status "${panel}")" == "period_closed" ]]; then
     if [[ "${patched}" == "yes" && "${PANEL_LIMIT}" == "${APPLIED_LIMIT}" ]]; then
       _note_period_crossed
@@ -375,12 +389,14 @@ START_AT="$(date -u -d "${PERIOD}-01 00:20:00 UTC" +'%Y-%m-%dT%H:%M:%SZ')"
 END_AT="$(date -u -d "${PERIOD}-01 00:20:00 UTC + 1 month" +'%Y-%m-%dT%H:%M:%SZ')"
 jq -e -n --argjson row "${SETTINGS_JSON}" --arg start "${START_AT}" --arg end "${END_AT}" --argjson max "${MAX_BYTES}" '
   def safeint: type == "number" and (floor == .) and . > 0 and . <= $max;
+  def money: if type == "number" then tostring elif type == "string" then . else "" end;
   $row | (.base_limit_bytes | safeint)
     and (.addon_bytes | safeint)
     and (.applied_limit_bytes | safeint)
     and (.applied_limit_bytes == (.base_limit_bytes + .addon_bytes))
     and .period_starts_at == $start
     and .period_ends_at == $end
+    and ((.expected_amount | money) | test("^[0-9]+(\\.[0-9]{1,2})?$") and (tonumber > 0))
 ' >/dev/null || stop_permanent "bad_settings"
 BASE_LIMIT="$(jq -r '.base_limit_bytes' <<<"${SETTINGS_JSON}")"
 ADDON_LIMIT="$(jq -r '.addon_bytes' <<<"${SETTINGS_JSON}")"
@@ -390,13 +406,20 @@ STAGE="period_window"
 _require_period ""
 STAGE="payment"
 log "catalog_cost=${CATALOG_COST} addon_bytes=${ADDON_LIMIT}"
-paid="$(jq -r --arg us "${ADDON_US_ID}" --arg user "${ADDON_USER_ID}" --arg service "${EXPECTED_SERVICE_ID}" '
+paid="$(jq -r --argjson settings "${SETTINGS_JSON}" --arg us "${ADDON_US_ID}" --arg user "${ADDON_USER_ID}" --arg service "${EXPECTED_SERVICE_ID}" '
+  def cents:
+    (if type == "number" then tostring elif type == "string" then . else "" end) as $t
+    | if ($t | test("^[0-9]+(\\.[0-9]{1,2})?$")) then
+        $t | capture("^(?<w>[0-9]+)(?:\\.(?<f>[0-9]{1,2}))?$") as $p
+        | ($p.w | tonumber) * 100 + ((($p.f // "") + "00")[0:2] | tonumber)
+      else -1 end;
   if (.withdraw_date | type != "string" or length == 0) then "unpaid"
   elif (.user_service_id | tostring) != $us
     or (.user_id | tostring) != $user
     or (.service_id | tostring) != $service
     or (.withdraw_id | type != "number" or . <= 0)
-    or ((.total | tonumber? // 0) <= 0) then "mismatch"
+    or ((.total | cents) <= 0)
+    or ((.total | cents) != ($settings.expected_amount | cents)) then "mismatch"
   else "ok" end
 ' <<<"${WITHDRAW_JSON}")" || stop_temporary "withdraw_unreadable"
 case "${paid}" in
@@ -428,8 +451,9 @@ if [[ "${PANEL_LIMIT}" != "${BASE_LIMIT}" ]]; then
 fi
 
 STAGE="patch"
+PATCH_UUID="${PANEL_UUID}"
 patch_body="$(_tmp)"
-jq -n --arg uuid "${PANEL_UUID}" --argjson trafficLimitBytes "${APPLIED_LIMIT}" \
+jq -n --arg uuid "${PATCH_UUID}" --argjson trafficLimitBytes "${APPLIED_LIMIT}" \
   '{uuid:$uuid, trafficLimitBytes:$trafficLimitBytes}' >"${patch_body}"
 patch_dest="$(_tmp)"
 patch_code="$(_curl_code "${patch_dest}" -X PATCH -H "$(_auth_header)" \
@@ -437,6 +461,7 @@ patch_code="$(_curl_code "${patch_dest}" -X PATCH -H "$(_auth_header)" \
   "${PANEL_URL}/api/users")"
 PANEL_FILE="$(_panel_file)"
 _load_panel_fields "${PANEL_FILE}"
+_require_patched_uuid
 if [[ "$(_period_status "${PANEL_FILE}")" == "period_closed" && "${PANEL_LIMIT}" == "${APPLIED_LIMIT}" ]]; then
   _note_period_crossed
 fi
