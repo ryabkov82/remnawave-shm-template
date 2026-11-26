@@ -2,9 +2,11 @@
 #
 # remnawave_traffic_addon
 #
-# CREATE для услуги «Дополнительный трафик 300 ГБ». Повышает лимит уже
+# CREATE для услуги «Дополнительный трафик 300 ГБ» повышает лимит уже
 # существующего пользователя Remnawave us_<parent_user_service_id> до
 # абсолютного итога из user_services.settings этой покупки.
+# REMOVE возвращает сохранённую базу после конца периода и подтверждённого
+# сброса. Срок, статус и параметры подключения не меняются.
 #
 # Оплата читается из списания текущего экземпляра. Собственного состояния,
 # storage, подписи и блокировки у шаблона нет: результат — код выхода spool.
@@ -74,6 +76,18 @@ __SHM_JSON__{{ toJson(us.withdraw.get) }}
 __SHM_WITHDRAW_JSON__
 )"
 WITHDRAW_JSON="${WITHDRAW_JSON#__SHM_JSON__}"
+ADDON_SERVICES_JSON="null"
+ADDON_WITHDRAWS_JSON="null"
+# {{ IF event_name == 'REMOVE' }}
+ADDON_SERVICES_JSON="$(cat <<'__SHM_ADDON_SERVICES__'
+__SHM_JSON__{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}
+__SHM_ADDON_SERVICES__
+)"
+ADDON_WITHDRAWS_JSON="$(cat <<'__SHM_ADDON_WITHDRAWS__'
+__SHM_JSON__{{ toJson(user.wd.list(where = { service_id = 17 })) }}
+__SHM_ADDON_WITHDRAWS__
+)"
+# {{ END }}
 
 EXPECTED_SERVICE_ID="17"
 EXPECTED_CATEGORY="traffic-add-vff"
@@ -344,6 +358,165 @@ _confirm_and_finish() {
   exit 0
 }
 
+_panel_optional() {
+  local dest code
+  dest="$(_tmp)" || return 1
+  code="$(_curl_code "${dest}" -H "$(_auth_header)" \
+    "${PANEL_URL}/api/users/by-username/us_${PARENT_US_ID}")"
+  if [[ "${code}" == "transport" || "${code}" =~ ^5 ]]; then
+    stop_temporary "panel_unavailable"
+  fi
+  if [[ "${code}" == "404" ]]; then
+    echo ""
+    return 0
+  fi
+  if [[ "${code}" != "200" ]]; then
+    stop_temporary "panel_read_${code}"
+  fi
+  jq -e -c '.response | type == "object"' "${dest}" >/dev/null || stop_temporary "panel_malformed"
+  echo "${dest}"
+}
+
+_other_live_pack() {
+  local now_iso="$1" rows withdraws
+  rows="${ADDON_SERVICES_JSON#__SHM_JSON__}"
+  withdraws="${ADDON_WITHDRAWS_JSON#__SHM_JSON__}"
+  if [[ -z "${rows//[[:space:]]/}" ]]; then
+    rows="[]"
+  fi
+  if [[ -z "${withdraws//[[:space:]]/}" ]]; then
+    withdraws="[]"
+  fi
+  jq -n -r --arg self "${ADDON_US_ID}" --arg parent "${PARENT_US_ID}" --arg user "${ADDON_USER_ID}" --arg now "${now_iso}" --argjson rows "${rows}" --argjson withdraws "${withdraws}" '
+    def as_rows:
+      if . == null then error("unreadable")
+      elif type == "array" then .
+      elif type == "object" and (.user_service_id != null or .withdraw_id != null) then [.]
+      elif type == "object" then [.[] | select(type == "object")]
+      else error("unreadable") end;
+    def cents:
+      (if type == "number" then tostring elif type == "string" then . else "" end) as $t
+      | if ($t | test("^[0-9]+(\\.[0-9]{1,2})?$")) then
+          $t | capture("^(?<w>[0-9]+)(?:\\.(?<f>[0-9]{1,2}))?$") as $p
+          | ($p.w | tonumber) * 100 + ((($p.f // "") + "00")[0:2] | tonumber)
+        else -1 end;
+    ($rows | as_rows) as $list
+    | ($withdraws | as_rows) as $paid
+    | reduce $list[] as $row ("clear";
+        if . == "block" then .
+        elif ($row.user_service_id | tostring) == $self then .
+        elif ($row.settings.parent_user_service_id | tostring) != $parent then .
+        elif ($row.settings | type) != "object"
+          or ($row.settings.period_ends_at | type) != "string"
+          or (($row.settings.expected_amount | cents) <= 0) then error("unreadable")
+        elif ([($row.status // "") | ascii_upcase] | .[0]) as $status
+          | ($status != "ACTIVE" and $status != "REMOVED" and $status != "PROGRESS") then .
+        else
+          [ $paid[] | select((.user_service_id | tostring) == ($row.user_service_id | tostring)) ] as $mine
+          | if any($mine[]; (.withdraw_date | type) == "string" and (.withdraw_date | length) > 0 and ((.total | cents) <= 0)) then error("unreadable")
+            elif any($mine[];
+              (.withdraw_date | type) == "string" and (.withdraw_date | length) > 0
+              and (.withdraw_id | type) == "number" and .withdraw_id > 0
+              and (.user_id | tostring) == $user
+              and (.service_id | tostring) == "17"
+              and (.total | cents) == ($row.settings.expected_amount | cents)
+            ) and ($row.settings.period_ends_at > $now) then "block"
+            else . end
+        end
+      )
+  '
+}
+
+_restore_base() {
+  local body dest code panel limit uuid
+  PATCH_UUID="${PANEL_UUID}"
+  body="$(_tmp)"
+  jq -n --arg uuid "${PATCH_UUID}" --argjson trafficLimitBytes "${BASE_LIMIT}" \
+    '{uuid:$uuid, trafficLimitBytes:$trafficLimitBytes}' >"${body}"
+  dest="$(_tmp)"
+  code="$(_curl_code "${dest}" -X PATCH -H "$(_auth_header)" \
+    -H "Content-Type: application/json" --data-binary @"${body}" \
+    "${PANEL_URL}/api/users")"
+  panel="$(_panel_optional)" || stop_temporary "panel_io"
+  if [[ -z "${panel}" ]]; then
+    stop_temporary "panel_unavailable"
+  fi
+  limit="$(jq -r '.response.trafficLimitBytes | tonumber? // empty' "${panel}")"
+  uuid="$(jq -r '.response.uuid // empty' "${panel}")"
+  [[ "${uuid}" == "${PATCH_UUID}" ]] || stop_permanent "panel_uuid_mismatch"
+  if [[ "${limit}" == "${BASE_LIMIT}" ]]; then
+    log "base_limit_bytes=${BASE_LIMIT} restored"
+    echo "RESULT level=ok reason=restored" >&2
+    exit 0
+  fi
+  if [[ "${code}" == "transport" || "${code}" =~ ^5 || "${code}" == "408" || "${code}" == "429" || "${code}" != "200" ]]; then
+    stop_temporary "panel_unavailable"
+  fi
+  stop_temporary "limit_not_restored"
+}
+
+_finish_remove() {
+  local now_epoch end_epoch parent_file parent_code reason panel reset_at reset_epoch decision now_iso
+  now_epoch="$(_now_epoch)"
+  end_epoch="$(_epoch "${END_AT}")" || stop_temporary "period_bounds"
+  if (( now_epoch < end_epoch )); then
+    stop_temporary "period_open"
+  fi
+  parent_file="$(_tmp)" || stop_temporary "shm_io"
+  parent_code="$(_curl_code "${parent_file}" -H "session-id: ${SESSION_ID}" \
+    "${API_URL}/shm/v1/user/service?user_service_id=${PARENT_US_ID}")"
+  if [[ "${parent_code}" == "transport" || "${parent_code}" =~ ^5 ]]; then
+    stop_temporary "shm_unavailable"
+  fi
+  if [[ "${parent_code}" == "200" ]]; then
+    reason="$(jq -r --arg parent_id "${PARENT_US_ID}" --arg user "${ADDON_USER_ID}" '
+      if (.data | type != "array") or (.data | length != 1) then "parent_not_owned"
+      elif (.data[0].user_service_id | tostring) != $parent_id then "parent_not_owned"
+      elif (.data[0].user_id | tostring) != $user then "parent_not_owned"
+      else "ok" end
+    ' "${parent_file}")" || stop_temporary "parent_unreadable"
+    [[ "${reason}" == "ok" ]] || stop_permanent "${reason}"
+  elif [[ "${parent_code}" != "404" ]]; then
+    stop_temporary "shm_parent_${parent_code}"
+  fi
+  panel="$(_panel_optional)" || stop_temporary "panel_io"
+  if [[ -z "${panel}" ]]; then
+    if [[ "${parent_code}" == "404" ]]; then
+      echo "RESULT level=ok reason=parent_absent" >&2
+      exit 0
+    fi
+    stop_temporary "panel_user_missing"
+  fi
+  reset_at="$(jq -r 'if (.response.lastTrafficResetAt | type) == "string" then .response.lastTrafficResetAt else "" end' "${panel}")"
+  [[ -n "${reset_at}" ]] || stop_temporary "reset_not_confirmed"
+  reset_epoch="$(_epoch "${reset_at}")" || stop_temporary "reset_not_confirmed"
+  if (( reset_epoch < end_epoch || reset_epoch > now_epoch )); then
+    stop_temporary "reset_not_confirmed"
+  fi
+  now_iso="$(date -u -d "@${now_epoch}" +%Y-%m-%dT%H:%M:%SZ)"
+  decision="$(_other_live_pack "${now_iso}")" || stop_temporary "history_unreadable"
+  if [[ "${decision}" == "block" ]]; then
+    echo "RESULT level=ok reason=newer_pack" >&2
+    exit 0
+  fi
+  [[ "${decision}" == "clear" ]] || stop_temporary "history_unreadable"
+  PANEL_USERNAME="$(jq -r '.response.username // empty' "${panel}")"
+  PANEL_UUID="$(jq -r '.response.uuid // empty' "${panel}")"
+  PANEL_LIMIT="$(jq -r '.response.trafficLimitBytes | tonumber? // empty' "${panel}")"
+  [[ "${PANEL_USERNAME}" == "us_${PARENT_US_ID}" ]] || stop_permanent "panel_username_mismatch"
+  [[ "${PANEL_UUID}" =~ ^[0-9a-fA-F-]{36}$ ]] || stop_temporary "panel_malformed"
+  [[ "${PANEL_LIMIT}" =~ ^[0-9]+$ ]] || stop_temporary "panel_malformed"
+  if [[ "${PANEL_LIMIT}" == "${BASE_LIMIT}" ]]; then
+    echo "RESULT level=ok reason=already_base" >&2
+    exit 0
+  fi
+  if [[ "${PANEL_LIMIT}" != "${APPLIED_LIMIT}" ]]; then
+    echo "RESULT level=ok reason=limit_kept" >&2
+    exit 0
+  fi
+  _restore_base
+}
+
 command -v curl >/dev/null 2>&1 || stop_permanent "curl_missing"
 command -v jq >/dev/null 2>&1 || stop_permanent "jq_missing"
 command -v date >/dev/null 2>&1 || stop_permanent "date_missing"
@@ -357,7 +530,7 @@ ADDON_USER_ID="$(_scalar "${_RAW_USER}")" || stop_permanent "bad_user_id"
 ADDON_SERVICE_ID="$(_scalar "${_RAW_SERVICE}")" || stop_permanent "unexpected_service"
 ADDON_CATEGORY="$(_scalar "${_RAW_CATEGORY}")" || stop_permanent "unexpected_category"
 CATALOG_COST="$(_scalar "${_RAW_COST}")" || stop_permanent "bad_catalog_cost"
-[[ "${EVENT}" == "CREATE" ]] || stop_permanent "unexpected_event"
+[[ "${EVENT}" == "CREATE" || "${EVENT}" == "REMOVE" ]] || stop_permanent "unexpected_event"
 [[ "${ADDON_US_ID}" =~ ^[1-9][0-9]*$ ]] || stop_permanent "bad_addon_id"
 [[ "${ADDON_USER_ID}" =~ ^[1-9][0-9]*$ ]] || stop_permanent "bad_user_id"
 [[ "${ADDON_SERVICE_ID}" == "${EXPECTED_SERVICE_ID}" ]] || stop_permanent "unexpected_service"
@@ -402,8 +575,6 @@ BASE_LIMIT="$(jq -r '.base_limit_bytes' <<<"${SETTINGS_JSON}")"
 ADDON_LIMIT="$(jq -r '.addon_bytes' <<<"${SETTINGS_JSON}")"
 APPLIED_LIMIT="$(jq -r '.applied_limit_bytes' <<<"${SETTINGS_JSON}")"
 
-STAGE="period_window"
-_require_period ""
 STAGE="payment"
 log "catalog_cost=${CATALOG_COST} addon_bytes=${ADDON_LIMIT}"
 paid="$(jq -r --argjson settings "${SETTINGS_JSON}" --arg us "${ADDON_US_ID}" --arg user "${ADDON_USER_ID}" --arg service "${EXPECTED_SERVICE_ID}" '
@@ -428,6 +599,12 @@ case "${paid}" in
   *) stop_permanent "payment_mismatch" ;;
 esac
 
+if [[ "${EVENT}" == "REMOVE" ]]; then
+  _finish_remove
+fi
+
+STAGE="period_window"
+_require_period ""
 STAGE="parent"
 _require_parent
 STAGE="panel"
