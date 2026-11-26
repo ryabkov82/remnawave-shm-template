@@ -121,6 +121,12 @@ def _render(event: str, panel_url: str, api_url: str) -> str:
         "{{ us.id }}": "71",
         "{{ server.settings.remnawave.sanitize_username }}": "false",
         "{{ us.expire }}": "2026-12-31 23:59:59",
+        "{{ us.service.category }}": "",
+        "{{ us.service_id }}": "",
+        "{{ us.user_id }}": "",
+        "{{ toJson(service(17).config) }}": "null",
+        "{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}": "[]",
+        "{{ toJson(user.wd.list(where = { service_id = 17 })) }}": "[]",
         "{{ toJson(user.login) }}": json.dumps("alice"),
         "{{ toJson(user.full_name) }}": json.dumps("Alice Example"),
         "{{ toJson(user.settings.telegram.login) }}": json.dumps("alice_tg"),
@@ -363,18 +369,24 @@ class RemoveIdempotencyTests(DisableEnvProxiesMixin, unittest.TestCase):
         remove = text.split("REMOVE)", 1)[1].split("PROLONGATE)", 1)[0]
         self.assertIn("_lookup_user_id_for_remove", remove)
         self.assertNotIn("_user_id_by_username", remove)
+        block = text.split("BLOCK)", 1)[1].split("REMOVE)", 1)[0]
+        self.assertIn('user_id="$(_user_id_by_username "${USERNAME_SANITIZED}")"', block)
+        self.assertNotIn("_lookup_user_id_for_remove", block)
         for event, end in (
             ("ACTIVATE)", "BLOCK)"),
-            ("BLOCK)", "REMOVE)"),
             ("PROLONGATE)", "UPDATE)"),
         ):
             branch = text.split(event, 1)[1].split(end, 1)[0]
-            self.assertIn('user_id="$(_user_id_by_username "${USERNAME_SANITIZED}")"', branch)
+            self.assertIn('_load_panel_user "${USERNAME_SANITIZED}"', branch)
+            self.assertIn('user_id="${PANEL_USER_ID}"', branch)
+            self.assertNotIn("_user_id_by_username", branch)
             self.assertNotIn("_lookup_user_id_for_remove", branch)
         definition = text.split("_user_id_by_username()", 1)[1].split(
             "_lookup_user_id_for_remove()", 1
         )[0]
         self.assertIn('fail "User not found: ${username}"', definition)
+        panel = text.split("_load_panel_user()", 1)[1].split("_now_epoch()", 1)[0]
+        self.assertIn('fail "User not found: ${username}"', panel)
 
 
 if __name__ == "__main__":

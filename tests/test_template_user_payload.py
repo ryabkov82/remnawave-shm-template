@@ -71,6 +71,12 @@ def _render(
         "{{ us.id }}": "42",
         "{{ server.settings.remnawave.sanitize_username }}": "false",
         "{{ us.expire }}": expire,
+        "{{ us.service.category }}": "",
+        "{{ us.service_id }}": "",
+        "{{ us.user_id }}": "",
+        "{{ toJson(service(17).config) }}": "null",
+        "{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}": "[]",
+        "{{ toJson(user.wd.list(where = { service_id = 17 })) }}": "[]",
     }
     # SHM replaces {{ toJson(user.*) }} with a JSON string. The unfixed template
     # still interpolates the raw {{ user.* }} value into shell source.

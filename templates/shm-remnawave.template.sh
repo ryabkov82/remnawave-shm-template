@@ -28,6 +28,16 @@
 # any other status, and HTTP 200 without a numeric response.id stay fatal.
 # ACTIVATE / BLOCK / PROLONGATE keep the strict _user_id_by_username lookup.
 #
+# ACTIVATE and PROLONGATE of a VFF Standard subscription keep a paid
+# service-17 pack for the current Remnawave month. The pack list and its
+# withdraws are read from stock SHM objects while the template is rendered,
+# so the SSH host does not receive an SHM admin token. CREATE, BLOCK, REMOVE,
+# UPDATE, Friends Connect and Premium keep the catalog limit. Traffic reset
+# is unchanged. TRAFFIC_ADDON_CLOCK_FILE is a test seam and is unset in
+# Production. An unreadable pack history does not replace an elevated panel
+# limit with the catalog base; if that panel limit cannot be read, the
+# script exits 1 and spool retries the event.
+#
 # CREATE is safe to run again after a partial execution. SHM sends this
 # whole script as one SSH command (stdin, no tty). The remote shell can
 # die after Remnawave has created the user and before the storage PUT;
@@ -100,6 +110,27 @@ SERVICE_EXTERNAL_SQUAD_NAME="{{ us.service.settings.remnawave.external_squad_nam
 SERVICE_TRAFFIC_LIMIT_BYTES="{{ us.service.settings.remnawave.traffic_limit_bytes }}"
 SERVICE_TRAFFIC_LIMIT_STRATEGY="{{ us.service.settings.remnawave.traffic_limit_strategy }}"
 SERVICE_HWID_DEVICE_LIMIT="{{ us.service.settings.remnawave.hwid_device_limit }}"
+PARENT_CATEGORY="{{ us.service.category }}"
+PARENT_SERVICE_ID="{{ us.service_id }}"
+PARENT_US_ID="{{ us.id }}"
+PARENT_USER_ID="{{ us.user_id }}"
+# Service 17, its instances (including REMOVED) and its withdraws. Rendered
+# on the SHM host. status=ANY is the stock list switch that keeps REMOVED rows.
+ADDON_CATALOG_JSON="$(cat <<'__SHM_ADDON_CATALOG_JSON__'
+__SHM_JSON__{{ toJson(service(17).config) }}
+__SHM_ADDON_CATALOG_JSON__
+)"
+ADDON_CATALOG_JSON="${ADDON_CATALOG_JSON#__SHM_JSON__}"
+ADDON_SERVICES_JSON="$(cat <<'__SHM_ADDON_SERVICES_JSON__'
+__SHM_JSON__{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}
+__SHM_ADDON_SERVICES_JSON__
+)"
+ADDON_SERVICES_JSON="${ADDON_SERVICES_JSON#__SHM_JSON__}"
+ADDON_WITHDRAWS_JSON="$(cat <<'__SHM_ADDON_WITHDRAWS_JSON__'
+__SHM_JSON__{{ toJson(user.wd.list(where = { service_id = 17 })) }}
+__SHM_ADDON_WITHDRAWS_JSON__
+)"
+ADDON_WITHDRAWS_JSON="${ADDON_WITHDRAWS_JSON#__SHM_JSON__}"
 
 # ---- server.settings.remnawave optional ----
 REMNAWAVE_SHM_TZ="{{ server.settings.remnawave.shm_tz }}"
@@ -420,6 +451,203 @@ _effective_traffic_limit_bytes() {
   echo "${v}"
 }
 
+# One GET for ACTIVATE/PROLONGATE. BLOCK still uses _user_id_by_username.
+_load_panel_user() {
+  local username="$1"
+  local body
+  body="$(_http_get "/api/users/by-username/${username}")" || fail "User lookup failed for ${username}"
+  PANEL_USER_ID="$(jq -r '.response.id // empty' <<<"${body}")" || fail "User lookup failed for ${username}"
+  [[ "${PANEL_USER_ID}" =~ ^[1-9][0-9]*$ ]] || fail "User not found: ${username}"
+  PANEL_TRAFFIC_LIMIT="$(jq -r 'if (.response.trafficLimitBytes | type) == "number" then (.response.trafficLimitBytes | tostring) else "" end' <<<"${body}")" || fail "User lookup failed for ${username}"
+  PANEL_RESET_AT="$(jq -r 'if (.response.lastTrafficResetAt | type) == "string" then .response.lastTrafficResetAt else "" end' <<<"${body}")" || fail "User lookup failed for ${username}"
+}
+
+_now_epoch() {
+  if [[ -n "${TRAFFIC_ADDON_CLOCK_FILE:-}" ]]; then
+    date -u -d "$(<"${TRAFFIC_ADDON_CLOCK_FILE}")" +%s
+  else
+    date -u +%s
+  fi
+}
+
+# 0: the pack still belongs to the open Remnawave month.
+# 1: the pack is outside that month and its reset is already confirmed.
+# 2: the clock or the bounds cannot be read.
+_pack_applies_now() {
+  local start="$1"
+  local end="$2"
+  local now start_epoch end_epoch reset_epoch
+  now="$(_now_epoch)" || return 2
+  start_epoch="$(date -u -d "${start}" +%s)" || return 2
+  end_epoch="$(date -u -d "${end}" +%s)" || return 2
+  if (( now < start_epoch )); then
+    return 1
+  fi
+  if (( now < end_epoch )); then
+    return 0
+  fi
+  if [[ -z "${PANEL_RESET_AT}" ]]; then
+    return 0
+  fi
+  reset_epoch="$(date -u -d "${PANEL_RESET_AT}" +%s)" || return 0
+  if (( reset_epoch < end_epoch )); then
+    return 0
+  fi
+  return 1
+}
+
+# Prints "use <bytes>" or "preserve". Friends Connect, Premium and every
+# non-MONTH tariff get the catalog value. A paid current pack prints its
+# stored applied_limit_bytes. Unreadable history prints preserve.
+_addon_limit_decision() {
+  local base="$1"
+  if [[ "${PARENT_CATEGORY}" != "vpn-mz-test" ]]; then
+    echo "use ${base}"
+    return 0
+  fi
+  if [[ "$(_effective_traffic_limit_strategy)" != "MONTH" ]]; then
+    echo "use ${base}"
+    return 0
+  fi
+  local classified
+  if ! classified="$(jq -n -er --arg parent "${PARENT_US_ID}" --arg service "${PARENT_SERVICE_ID}" --arg user "${PARENT_USER_ID}" --argjson catalog "${ADDON_CATALOG_JSON}" --argjson rows "${ADDON_SERVICES_JSON}" --argjson withdraws "${ADDON_WITHDRAWS_JSON}" '
+    def as_rows:
+      if type == "array" then .
+      elif type == "object" then [ .[] ]
+      else error("shape") end;
+    def cents:
+      (if type == "number" then tostring elif type == "string" then . else "" end) as $t
+      | if ($t | test("^[0-9]+(\\.[0-9]{1,2})?$")) then
+          $t | capture("^(?<w>[0-9]+)(?:\\.(?<f>[0-9]{1,2}))?$") as $p
+          | ($p.w | tonumber) * 100 + ((($p.f // "") + "00")[0:2] | tonumber)
+        else -1 end;
+    def month_end($period):
+      ($period[0:4] | tonumber) as $y
+      | ($period[5:7] | tonumber) as $m
+      | if $m == 12 then "\($y + 1)-01-01T00:20:00Z"
+        else "\($y)-\(((($m + 1) | if . < 10 then "0\(.)" else "\(.)" end)))-01T00:20:00Z"
+        end;
+    def safeint: type == "number" and (floor == .) and . > 0 and . <= 9007199254740991;
+    def settings_ok:
+      type == "object"
+      and (.parent_user_service_id | tostring) == $parent
+      and (.period | type == "string" and test("^[0-9]{4}-[0-9]{2}$"))
+      and .period_starts_at == (.period + "-01T00:20:00Z")
+      and .period_ends_at == month_end(.period)
+      and (.base_limit_bytes | safeint)
+      and (.addon_bytes | safeint)
+      and (.applied_limit_bytes | safeint)
+      and .applied_limit_bytes == (.base_limit_bytes + .addon_bytes)
+      and ((.expected_amount | cents) > 0);
+    if ($catalog | type) != "object"
+      or ($catalog.traffic_addon | type) != "object"
+      or $catalog.traffic_addon.brand != "vff"
+      or $catalog.traffic_addon.parent_category != "vpn-mz-test"
+      or $catalog.traffic_addon.strategy != "MONTH"
+      or ($catalog.traffic_addon.parent_service_ids | type) != "array"
+      or (($catalog.traffic_addon.parent_service_ids | map(tostring)) | index($service) | not)
+      then {action:"use"}
+    else
+      ($rows | as_rows) as $services
+      | ($withdraws | as_rows) as $paid
+      | reduce $services[] as $row ({items:[]};
+          if ($row | type) != "object" or ($row.service_id | tostring) != "17" then error("row")
+          elif ($row.settings | type) != "object" then error("settings")
+          elif ($row.settings.parent_user_service_id | tostring) != $parent then .
+          elif ($row.settings | settings_ok | not) then error("settings")
+          else
+            [ $paid[] | select((.user_service_id | tostring) == ($row.user_service_id | tostring)) ] as $mine
+            | if any($mine[]; (.withdraw_date | type) == "string" and (.withdraw_date | length) > 0 and ((.total | cents) <= 0)) then error("withdraw")
+            else
+              ( [ $mine[] | select(
+                  (.withdraw_date | type) == "string" and (.withdraw_date | length) > 0
+                  and (.withdraw_id | type) == "number" and .withdraw_id > 0
+                  and (.user_id | tostring) == $user
+                  and (.service_id | tostring) == "17"
+                  and (.total | cents) == ($row.settings.expected_amount | cents)
+                ) ] | length ) as $matches
+              | ( [ $mine[] | select((.withdraw_date | type) == "string" and (.withdraw_date | length) > 0) ] | length ) as $dated
+              | if $matches > 0 and (( $row.status | ascii_upcase ) == "ACTIVE" or ($row.status | ascii_upcase) == "REMOVED" or ($row.status | ascii_upcase) == "PROGRESS") then
+                  .items += [{kind:"grant", applied: ($row.settings.applied_limit_bytes | tostring), start:$row.settings.period_starts_at, end:$row.settings.period_ends_at}]
+                elif $dated > 0 then
+                  .items += [{kind:"bad", start:$row.settings.period_starts_at, end:$row.settings.period_ends_at}]
+                else . end
+              end
+          end
+        )
+    end
+  ' )"; then
+    echo "preserve"
+    return 0
+  fi
+  local action
+  action="$(jq -r '.action // "candidates"' <<<"${classified}")" || { echo "preserve"; return 0; }
+  if [[ "${action}" == "use" ]]; then
+    echo "use ${base}"
+    return 0
+  fi
+  local bad=0
+  local grants=()
+  local line kind start end rc
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    kind="$(jq -r '.kind' <<<"${line}")" || { echo "preserve"; return 0; }
+    start="$(jq -r '.start' <<<"${line}")" || { echo "preserve"; return 0; }
+    end="$(jq -r '.end' <<<"${line}")" || { echo "preserve"; return 0; }
+    set +e
+    _pack_applies_now "${start}" "${end}"
+    rc=$?
+    set -e
+    if [[ "${rc}" -eq 1 ]]; then
+      continue
+    fi
+    if [[ "${rc}" -ne 0 ]]; then
+      echo "preserve"
+      return 0
+    fi
+    if [[ "${kind}" == "bad" ]]; then
+      bad=1
+    elif [[ "${kind}" == "grant" ]]; then
+      grants+=("$(jq -r '.applied' <<<"${line}")")
+    else
+      echo "preserve"
+      return 0
+    fi
+  done < <(jq -c '.items[]?' <<<"${classified}")
+  if [[ "${bad}" -ne 0 || "${#grants[@]}" -gt 1 ]]; then
+    echo "preserve"
+    return 0
+  fi
+  if [[ "${#grants[@]}" -eq 0 ]]; then
+    echo "use ${base}"
+    return 0
+  fi
+  echo "use ${grants[0]}"
+}
+
+_prepare_update_limit() {
+  local base decision
+  base="$(_effective_traffic_limit_bytes)"
+  decision="$(_addon_limit_decision "${base}")" || fail "addon limit decision failed"
+  case "${decision}" in
+    use\ [0-9]*)
+      UPDATE_TRAFFIC_LIMIT="${decision#use }"
+      ;;
+    preserve)
+      [[ "${PANEL_TRAFFIC_LIMIT}" =~ ^[0-9]+$ ]] || fail "panel traffic limit is unreadable; refusing to replace it"
+      if (( PANEL_TRAFFIC_LIMIT > base )); then
+        UPDATE_TRAFFIC_LIMIT="${PANEL_TRAFFIC_LIMIT}"
+      else
+        UPDATE_TRAFFIC_LIMIT="${base}"
+      fi
+      ;;
+    *)
+      fail "addon limit decision is unreadable"
+      ;;
+  esac
+  log "Update traffic limit bytes: ${UPDATE_TRAFFIC_LIMIT}"
+}
+
 _effective_traffic_limit_strategy() {
   local v="${SERVICE_TRAFFIC_LIMIT_STRATEGY:-}"
   [[ -n "${v}" && "${v}" != "null" ]] || { echo "NO_RESET"; return; }
@@ -608,7 +836,7 @@ _build_update_payload() {
   _require_user_id "${user_id}"
   _validate_hwid_device_limit
   local expire_iso="$(_expire_iso)"
-  local traffic_limit_bytes="$(_effective_traffic_limit_bytes)"
+  local traffic_limit_bytes="${UPDATE_TRAFFIC_LIMIT:-$(_effective_traffic_limit_bytes)}"
   local traffic_limit_strategy="$(_effective_traffic_limit_strategy)"
   local hwid_device_limit
   hwid_device_limit="$(_effective_hwid_device_limit)"
@@ -943,7 +1171,9 @@ case "${EVENT}" in
 
   ACTIVATE)
     log "Activate ${USERNAME_SANITIZED}"
-    user_id="$(_user_id_by_username "${USERNAME_SANITIZED}")"
+    _load_panel_user "${USERNAME_SANITIZED}"
+    _prepare_update_limit
+    user_id="${PANEL_USER_ID}"
 
     _enable_user "${user_id}"
     _log_effective_limits
@@ -984,7 +1214,9 @@ case "${EVENT}" in
 
   PROLONGATE)
     log "Prolongate ${USERNAME_SANITIZED}"
-    user_id="$(_user_id_by_username "${USERNAME_SANITIZED}")"
+    _load_panel_user "${USERNAME_SANITIZED}"
+    _prepare_update_limit
+    user_id="${PANEL_USER_ID}"
 
     _reset_traffic_on_prolongate_if_needed "${user_id}"
     _log_effective_limits
