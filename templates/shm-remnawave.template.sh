@@ -55,6 +55,17 @@
 # transfer, any other status, malformed JSON, or a different user is
 # fatal and does not write storage.
 #
+# SHM storage PUT /storage/manage/<name> is Storage::add (create).
+# A second PUT of an existing key returns HTTP 400 "already exists"
+# and does not change the row. POST is Storage::replace. CREATE and
+# UPDATE therefore read the key first: absence is PUT, an identical
+# body is success, and a different body is POST. Only that already-exists
+# 400 is retried by reading the key again. Any other HTTP 400 stays an
+# error. A write that times out is success only when the follow-up read
+# matches the payload. Storage curls use --max-time
+# ${REMNAWAVE_STORAGE_MAX_TIME:-15}; the SSH command timeout has to be
+# longer than that or the read alarm fires first.
+#
 set -euo pipefail
 
 # ---- SHM placeholders ----
@@ -830,11 +841,199 @@ _post_new_user() {
   _fail_create_response "${http_code}" "${body_file}"
 }
 
-# Fetch subscription JSON and PUT it to SHM. Does not change the panel user.
-# A non-200 subscription or a failed PUT leaves storage unwritten and fails
-# the script, so a later CREATE can retry this step.
+# Read one storage key. Prints an HTTP code, or "transport N" when curl
+# itself fails. The body is left in the destination file.
+_storage_time_limit() {
+  local limit="${REMNAWAVE_STORAGE_MAX_TIME:-15}"
+  [[ "${limit}" =~ ^[1-9][0-9]*$ ]] || fail "REMNAWAVE_STORAGE_MAX_TIME must be a positive integer"
+  echo "${limit}"
+}
+
+_storage_url() {
+  echo "${API_URL}/shm/v1/storage/manage/vpn_mrzb_{{ us.id }}"
+}
+
+_storage_short_error() {
+  local file="$1" text
+  if [[ ! -s "${file}" ]]; then
+    echo "empty response"
+    return 0
+  fi
+  text="$(jq -r 'if type == "object" then (.error // .msg // .message // "unknown") | tostring else "unknown" end' "${file}" 2>/dev/null || echo "unknown")"
+  text="${text//$'\n'/ }"
+  echo "${text:0:180}"
+}
+
+_storage_read_to() {
+  local dest="$1" code curl_rc
+  code="$(
+    curl -skS --max-time "$(_storage_time_limit)" -o "${dest}" -w "%{http_code}" \
+      -H "session-id: ${SESSION_ID}" \
+      "$(_storage_url)"
+  )" && curl_rc=0 || curl_rc=$?
+  code="${code//$'\r'/}"
+  if [[ "${curl_rc}" -ne 0 || -z "${code}" || "${code}" == "000" ]]; then
+    echo "transport ${curl_rc:-0}"
+    return 0
+  fi
+  echo "${code}"
+}
+
+_storage_write() {
+  local method="$1" payload="$2" dest="$3" code curl_rc
+  code="$(
+    curl -skS --max-time "$(_storage_time_limit)" -o "${dest}" -w "%{http_code}" \
+      -X "${method}" \
+      -H "session-id: ${SESSION_ID}" \
+      -H "Content-Type: application/json; charset=utf-8" \
+      --data-binary @"${payload}" \
+      "$(_storage_url)"
+  )" && curl_rc=0 || curl_rc=$?
+  code="${code//$'\r'/}"
+  if [[ "${curl_rc}" -ne 0 || -z "${code}" || "${code}" == "000" ]]; then
+    echo "transport ${curl_rc:-0}"
+    return 0
+  fi
+  echo "${code}"
+}
+
+# absent | present | error
+_storage_state() {
+  local code="$1" file="$2" err
+  if [[ "${code}" == transport* ]]; then
+    echo "error"
+    return 0
+  fi
+  if [[ "${code}" == "404" ]]; then
+    echo "absent"
+    return 0
+  fi
+  if [[ "${code}" == "400" ]]; then
+    err="$(_storage_short_error "${file}")"
+    if [[ "${err}" == *"not found"* || "${err}" == *"Not found"* ]]; then
+      echo "absent"
+    else
+      echo "error"
+    fi
+    return 0
+  fi
+  if [[ "${code}" == "200" || "${code}" == "204" ]]; then
+    if [[ ! -s "${file}" ]]; then
+      echo "absent"
+      return 0
+    fi
+    if jq -e '. == null' "${file}" >/dev/null 2>&1; then
+      echo "absent"
+      return 0
+    fi
+    if jq -e 'type == "object"' "${file}" >/dev/null 2>&1; then
+      echo "present"
+      return 0
+    fi
+  fi
+  echo "error"
+}
+
+_storage_same() {
+  local left="$1" right="$2" a b
+  a="$(jq -c -S '.' "${left}")" || return 1
+  b="$(jq -c -S '.' "${right}")" || return 1
+  [[ -n "${a}" && "${a}" != "null" && "${a}" == "${b}" ]]
+}
+
+# Create or refresh vpn_mrzb_<us.id>. Does not change the panel user.
+# A matching stored body is success. A different body is POST replace.
+# HTTP 400 is success only when its text says the key already exists and
+# a follow-up read then matches this payload.
+_storage_save() {
+  local payload="$1"
+  local key="vpn_mrzb_{{ us.id }}"
+  local current reply read_code state err method write_code confirm
+  current="$(mktemp)" || fail "Upload to SHM storage ${key} failed: mktemp failed"
+  reply="$(mktemp)" || { rm -f "${current}"; fail "Upload to SHM storage ${key} failed: mktemp failed"; }
+
+  read_code="$(_storage_read_to "${current}")"
+  state="$(_storage_state "${read_code}" "${current}")"
+  if [[ "${state}" == "error" ]]; then
+    if [[ "${read_code}" == transport* ]]; then
+      err="curl exit ${read_code#transport }"
+    else
+      err="HTTP ${read_code}: $(_storage_short_error "${current}")"
+    fi
+    rm -f "${current}" "${reply}"
+    fail "Read SHM storage ${key} failed: ${err}"
+  fi
+
+  if [[ "${state}" == "present" ]] && _storage_same "${current}" "${payload}"; then
+    rm -f "${current}" "${reply}"
+    return 0
+  fi
+
+  method="PUT"
+  if [[ "${state}" == "present" ]]; then
+    method="POST"
+  fi
+  write_code="$(_storage_write "${method}" "${payload}" "${reply}")"
+
+  if [[ "${write_code}" == "400" && "${method}" == "PUT" ]]; then
+    err="$(_storage_short_error "${reply}")"
+    if [[ "${err}" != *"already exists"* ]]; then
+      rm -f "${current}" "${reply}"
+      fail "Upload to SHM storage ${key} failed: HTTP 400: ${err}"
+    fi
+  elif [[ "${write_code}" != transport* && "${write_code}" != 2* ]]; then
+    err="$(_storage_short_error "${reply}")"
+    rm -f "${current}" "${reply}"
+    fail "Upload to SHM storage ${key} failed: HTTP ${write_code}: ${err}"
+  fi
+
+  confirm="$(_storage_read_to "${current}")"
+  state="$(_storage_state "${confirm}" "${current}")"
+  if [[ "${state}" == "present" ]] && _storage_same "${current}" "${payload}"; then
+    rm -f "${current}" "${reply}"
+    return 0
+  fi
+
+  # GET said the key was absent, but PUT reported that it already exists
+  # and the stored body is different. One POST replace is the update API.
+  if [[ "${method}" == "PUT" && "${write_code}" == "400" && "${state}" == "present" ]]; then
+    method="POST"
+    write_code="$(_storage_write "${method}" "${payload}" "${reply}")"
+    if [[ "${write_code}" != transport* && "${write_code}" != 2* ]]; then
+      err="$(_storage_short_error "${reply}")"
+      rm -f "${current}" "${reply}"
+      fail "Upload to SHM storage ${key} failed: HTTP ${write_code}: ${err}"
+    fi
+    confirm="$(_storage_read_to "${current}")"
+    state="$(_storage_state "${confirm}" "${current}")"
+    if [[ "${state}" == "present" ]] && _storage_same "${current}" "${payload}"; then
+      rm -f "${current}" "${reply}"
+      return 0
+    fi
+  fi
+
+  if [[ "${write_code}" == "400" ]]; then
+    err="$(_storage_short_error "${reply}")"
+    rm -f "${current}" "${reply}"
+    fail "Upload to SHM storage ${key} failed: HTTP 400: ${err}"
+  fi
+  if [[ "${write_code}" == transport* ]]; then
+    rm -f "${current}" "${reply}"
+    fail "Upload to SHM storage ${key} failed: curl exit ${write_code#transport }"
+  fi
+  if [[ "${confirm}" == transport* ]]; then
+    rm -f "${current}" "${reply}"
+    fail "Read SHM storage ${key} failed: curl exit ${confirm#transport }"
+  fi
+  rm -f "${current}" "${reply}"
+  fail "Upload to SHM storage ${key} failed: stored JSON does not match"
+}
+
+# Fetch subscription JSON and store it in SHM. Does not change the panel user.
+# A non-200 subscription or a failed storage write leaves the script failed,
+# so a later CREATE can retry this step.
 _save_create_subscription() {
-  local body_file http_code curl_rc sub_json_body payload_file put_rc jq_rc
+  local body_file http_code curl_rc sub_json_body payload_file jq_rc
   log "Fetch subscription JSON"
   body_file="$(mktemp)" || fail "Subscription fetch failed for ${USERNAME_SANITIZED}: mktemp failed"
 
@@ -893,16 +1092,8 @@ _save_create_subscription() {
   log "Upload JSON to SHM key vpn_mrzb_{{ us.id }}"
   payload_file="$(mktemp)" || fail "Subscription upload failed for ${USERNAME_SANITIZED}: mktemp failed"
   printf '%s\n' "${sub_json_body}" > "${payload_file}"
-  set +e
-  curl -skS --fail-with-body -X PUT \
-    -H "session-id: ${SESSION_ID}" \
-    -H "Content-Type: application/json; charset=utf-8" \
-    --data-binary @"${payload_file}" \
-    "${API_URL}/shm/v1/storage/manage/vpn_mrzb_{{ us.id }}" >/dev/null
-  put_rc=$?
-  set -e
+  _storage_save "${payload_file}"
   rm -f "${payload_file}"
-  [[ "${put_rc}" -eq 0 ]] || fail "Upload to SHM storage vpn_mrzb_{{ us.id }} failed: curl exit ${put_rc}"
 }
 
 log "Remnawave Template v1.7"
@@ -997,13 +1188,10 @@ case "${EVENT}" in
     log "Update SHM JSON for ${USERNAME_SANITIZED}"
     sub_json="$(_subscription_json_by_username "${USERNAME_SANITIZED}")"
     sub_json_body="$(echo "${sub_json}" | _normalize_subscription_json | jq -c '.response')"
-    echo "${sub_json_body}" | jq -c '.' > /tmp/payload.json
-    curl -skS -X PUT \
-      -H "session-id: ${SESSION_ID}" \
-      -H "Content-Type: application/json; charset=utf-8" \
-      --data-binary @/tmp/payload.json \
-      "${API_URL}/shm/v1/storage/manage/vpn_mrzb_{{ us.id }}" >/dev/null
-    rm -f /tmp/payload.json
+    payload_file="$(mktemp)" || fail "Upload to SHM storage vpn_mrzb_{{ us.id }} failed: mktemp failed"
+    printf '%s\n' "${sub_json_body}" > "${payload_file}"
+    _storage_save "${payload_file}"
+    rm -f "${payload_file}"
     log "done"
     ;;
 
