@@ -79,8 +79,8 @@ def _render(
         "# {{ IF us.service.settings.remnawave.traffic_limit_strategy.upper == 'MONTH' }}": "",
         "# {{ IF us.service_id == 3 OR us.service_id == 4 OR us.service_id == 5 OR us.service_id == 6 }}": "",
         "# {{ END }}": "",
-        "{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}": "[]",
-        "{{ toJson(user.wd.list(where = { service_id = 17 })) }}": "[]",
+        "{{ toJson(user.services.items(where = { service_id = 17, status = 'ANY' }).pluck('pairs')) }}": "[]",
+        "{{ toJson(user.wd.items(where = { service_id = 17 }).pluck('pairs')) }}": "[]",
     }
     # SHM replaces {{ toJson(user.*) }} with a JSON string. The unfixed template
     # still interpolates the raw {{ user.* }} value into shell source.

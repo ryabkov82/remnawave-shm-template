@@ -30,8 +30,8 @@
 #
 # ACTIVATE and PROLONGATE of a VFF Standard subscription (services 3–6,
 # category vpn-mz-test, strategy MONTH) keep a paid service-17 pack for the
-# current Remnawave month. SHM renders user.services.list and user.wd.list
-# only inside that IF, immediately before SSH, so other events and categories
+# current Remnawave month. SHM renders items(where=...).pluck('pairs') only
+# inside that IF, immediately before SSH, so other events and categories
 # do not query pack history and the SSH host does not receive an SHM token.
 # The current service-17 catalog does not cancel a pack already stored in
 # user_services.settings. CREATE, BLOCK, REMOVE, UPDATE, Friends Connect and
@@ -128,9 +128,10 @@ PARENT_SERVICE_ID="{{ us.service_id }}"
 PARENT_US_ID="{{ us.id }}"
 PARENT_USER_ID="{{ us.user_id }}"
 # Pack history is queried only for ACTIVATE/PROLONGATE of VFF Standard MONTH.
-# status=ANY is the stock list switch that keeps REMOVED rows. list() adds no
-# LIMIT unless one is passed, and spool parses this template inside SSH send,
-# immediately before the command runs. Other events leave the sentinels below.
+# items() unpacks the Template Toolkit hash. status=ANY keeps REMOVED rows.
+# No limit is passed. pluck('pairs') returns plain rows for toJson.
+# Spool parses this template inside SSH send, immediately before the command
+# runs. Other events leave the sentinels below.
 ADDON_HISTORY_MODE="skip"
 ADDON_SERVICES_JSON="null"
 ADDON_WITHDRAWS_JSON="null"
@@ -140,12 +141,12 @@ ADDON_WITHDRAWS_JSON="null"
 # {{ IF us.service_id == 3 OR us.service_id == 4 OR us.service_id == 5 OR us.service_id == 6 }}
 ADDON_HISTORY_MODE="read"
 ADDON_SERVICES_JSON="$(cat <<'__SHM_ADDON_SERVICES_JSON__'
-__SHM_JSON__{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}
+__SHM_JSON__{{ toJson(user.services.items(where = { service_id = 17, status = 'ANY' }).pluck('pairs')) }}
 __SHM_ADDON_SERVICES_JSON__
 )"
 ADDON_SERVICES_JSON="${ADDON_SERVICES_JSON#__SHM_JSON__}"
 ADDON_WITHDRAWS_JSON="$(cat <<'__SHM_ADDON_WITHDRAWS_JSON__'
-__SHM_JSON__{{ toJson(user.wd.list(where = { service_id = 17 })) }}
+__SHM_JSON__{{ toJson(user.wd.items(where = { service_id = 17 }).pluck('pairs')) }}
 __SHM_ADDON_WITHDRAWS_JSON__
 )"
 ADDON_WITHDRAWS_JSON="${ADDON_WITHDRAWS_JSON#__SHM_JSON__}"

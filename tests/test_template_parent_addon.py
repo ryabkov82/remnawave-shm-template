@@ -186,10 +186,10 @@ def _render(
         "# {{ IF us.service.settings.remnawave.traffic_limit_strategy.upper == 'MONTH' }}": "",
         "# {{ IF us.service_id == 3 OR us.service_id == 4 OR us.service_id == 5 OR us.service_id == 6 }}": "",
         "# {{ END }}": "",
-        "{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}": rows_raw
+        "{{ toJson(user.services.items(where = { service_id = 17, status = 'ANY' }).pluck('pairs')) }}": rows_raw
         if rows_raw is not None
         else json.dumps([] if rows is None else rows),
-        "{{ toJson(user.wd.list(where = { service_id = 17 })) }}": withdraws_raw
+        "{{ toJson(user.wd.items(where = { service_id = 17 }).pluck('pairs')) }}": withdraws_raw
         if withdraws_raw is not None
         else json.dumps([] if withdraws is None else withdraws),
         "{{ toJson(user.login) }}": json.dumps("alice"),
@@ -415,8 +415,8 @@ class ParentAddonTests(unittest.TestCase):
         start = text.index("# {{ IF event_name == 'ACTIVATE' OR event_name == 'PROLONGATE' }}")
         end = text.index("# {{ END }}\n# {{ END }}\n# {{ END }}\n# {{ END }}", start)
         block = text[start:end]
-        services_call = "toJson(user.services.list(where = { service_id = 17, status = 'ANY' }))"
-        withdraws_call = "toJson(user.wd.list(where = { service_id = 17 }))"
+        services_call = "toJson(user.services.items(where = { service_id = 17, status = 'ANY' }).pluck('pairs'))"
+        withdraws_call = "toJson(user.wd.items(where = { service_id = 17 }).pluck('pairs'))"
         self.assertEqual(text.count(services_call), 1)
         self.assertEqual(text.count(withdraws_call), 1)
         self.assertIn(services_call, block)

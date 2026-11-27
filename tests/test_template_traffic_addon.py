@@ -351,10 +351,10 @@ def _render(
 ) -> str:
     values = {
         "{{ toJson(event_name) }}": json.dumps(fields.get("event", "CREATE"), ensure_ascii=False),
-        "{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}": json.dumps(
+        "{{ toJson(user.services.items(where = { service_id = 17, status = 'ANY' }).pluck('pairs')) }}": json.dumps(
             [] if services is _UNSET else services, ensure_ascii=False
         ),
-        "{{ toJson(user.wd.list(where = { service_id = 17 })) }}": json.dumps(
+        "{{ toJson(user.wd.items(where = { service_id = 17 }).pluck('pairs')) }}": json.dumps(
             [] if withdraws is _UNSET else withdraws, ensure_ascii=False
         ),
         "{{ toJson(user.gen_session.id) }}": json.dumps("session-test", ensure_ascii=False),
@@ -589,7 +589,7 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(_patches(world), [])
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
 
-    def test_03_remove_ignores_other_services_in_history(self) -> None:
+    def test_03_remove_rejects_a_non_addon_row_in_history(self) -> None:
         period = "2026-11"
         _, end = _period_bounds(period)
         standard = {
@@ -603,23 +603,10 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         world.user["trafficLimitBytes"] = TARGET
         world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
         result = self._remove(world, _stamp_epoch(end) + 3600, services=[standard], withdraws=[])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(_reason(result), "restored")
-        self.assertEqual(world.user["trafficLimitBytes"], BASE)
-        newer, money = _grant("2026-12", "ACTIVE")
-        blocked = World(period)
-        blocked.user["trafficLimitBytes"] = TARGET
-        blocked.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
-        blocked_result = self._remove(
-            blocked,
-            _stamp_epoch(end) + 3600,
-            services=[standard, newer],
-            withdraws=[money],
-        )
-        self.assertEqual(blocked_result.returncode, 0, blocked_result.stdout + blocked_result.stderr)
-        self.assertEqual(_reason(blocked_result), "newer_pack")
-        self.assertEqual(_patches(blocked), [])
-        self.assertEqual(blocked.user["trafficLimitBytes"], TARGET)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "history_unreadable")
+        self.assertEqual(_patches(world), [])
+        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
 
     def test_03_unpaid_withdraw_does_not_grant(self) -> None:
         period = _open_period()

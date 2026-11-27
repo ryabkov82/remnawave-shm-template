@@ -82,12 +82,15 @@ WITHDRAW_JSON="${WITHDRAW_JSON#__SHM_JSON__}"
 ADDON_SERVICES_JSON="null"
 ADDON_WITHDRAWS_JSON="null"
 # {{ IF event_name == 'REMOVE' }}
+# items() распаковывает хеш Template Toolkit и не ставит LIMIT.
+# status=ANY снимает исключение REMOVED. pluck('pairs') — скалярный get,
+# поэтому toJson получает массив записей, а не объекты или первый элемент.
 ADDON_SERVICES_JSON="$(cat <<'__SHM_ADDON_SERVICES__'
-__SHM_JSON__{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}
+__SHM_JSON__{{ toJson(user.services.items(where = { service_id = 17, status = 'ANY' }).pluck('pairs')) }}
 __SHM_ADDON_SERVICES__
 )"
 ADDON_WITHDRAWS_JSON="$(cat <<'__SHM_ADDON_WITHDRAWS__'
-__SHM_JSON__{{ toJson(user.wd.list(where = { service_id = 17 })) }}
+__SHM_JSON__{{ toJson(user.wd.items(where = { service_id = 17 }).pluck('pairs')) }}
 __SHM_ADDON_WITHDRAWS__
 )"
 # {{ END }}
@@ -191,9 +194,10 @@ _on_exit() {
 trap _on_exit EXIT
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/traffic-addon.XXXXXX")"
 
-# SHM 3.7.0 применяет user_service_id только из filter. Пользовательский
-# ответ не содержит user_id: список уже ограничен сессией. Чужой
-# идентификатор, если он всё же есть в ответе, по-прежнему отклоняется.
+# SHM 3.7.0 принимает и прямой user_service_id, и filter={"user_service_id":N}:
+# оба возвращают одну услугу. Здесь выбран filter. Пользовательский ответ
+# не содержит user_id: список уже ограничен сессией. Чужой идентификатор,
+# если он всё же есть в ответе, по-прежнему отклоняется.
 _parent_service_url() {
   local encoded
   encoded="$(jq -rn --arg id "${PARENT_US_ID}" '{user_service_id: ($id | tonumber)} | @uri')" \
@@ -436,8 +440,6 @@ _other_live_pack() {
     | reduce $list[] as $row ("clear";
         if . == "block" then .
         elif ($row.user_service_id | tostring) == $self then .
-        elif ($row.service_id == null) then error("unreadable")
-        elif ($row.service_id | tostring) != "17" then .
         elif ($row.settings | type) != "object"
           or ($row.settings.period_ends_at | type) != "string"
           or (($row.settings.expected_amount | cents) <= 0)
