@@ -134,6 +134,26 @@ def _settings(period: str) -> Dict[str, Any]:
     }
 
 
+# Object rendered by toJson(us.withdraw.pairs) for user service 11450 on
+# SHM 3.7.0. total is a JSON number. The same object is rendered for CREATE
+# and REMOVE. The flat list from us.withdraw.get is not accepted.
+PRODUCTION_WITHDRAW = {
+    "bonus": 0,
+    "cost": 150,
+    "create_date": "2026-11-27 17:40:24",
+    "discount": 0,
+    "end_date": "2026-11-27 17:40:23",
+    "months": 0,
+    "qnt": 1,
+    "service_id": 17,
+    "total": 150,
+    "user_id": 763,
+    "user_service_id": 11450,
+    "withdraw_date": "2026-11-27 17:40:24",
+    "withdraw_id": 15406,
+}
+
+
 def _withdraw(paid: bool, total: str = "150.00", **overrides: Any) -> Any:
     row: Dict[str, Any] = {
         "withdraw_id": 775501,
@@ -316,7 +336,7 @@ def _render(
         "{{ toJson(us.service.cost) }}": json.dumps(fields.get("cost", "150.00"), ensure_ascii=False),
         "{{ toJson(us.settings) }}": json.dumps(settings, ensure_ascii=False),
         "{{ toJson(us.service.settings) }}": "null" if catalog is _NULL else json.dumps(catalog, ensure_ascii=False),
-        "{{ toJson(us.withdraw.get) }}": json.dumps(withdraw, ensure_ascii=False),
+        "{{ toJson(us.withdraw.pairs) }}": json.dumps(withdraw, ensure_ascii=False),
     }
     text = TEMPLATE.read_text()
     text = text.replace("# {{ IF event_name == 'REMOVE' }}", "")
@@ -462,6 +482,60 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
         self.assertEqual(_patches(world), [])
         self.assert_clean(world, result)
+
+    def _production_world(self) -> World:
+        world = World(_open_period())
+        world.parent = _parent(user_id=763)
+        return world
+
+    def test_03_pairs_withdraw_pays_and_grants(self) -> None:
+        world = self._production_world()
+        result = self._execute(world, withdraw=PRODUCTION_WITHDRAW, us_id="11450", user_id="763")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
+        self.assertEqual(len(_patches(world)), 1)
+        self.assert_clean(world, result)
+
+    def test_03_pairs_withdraw_rejects_foreign_owner_instance_and_amount(self) -> None:
+        foreign_user = dict(PRODUCTION_WITHDRAW)
+        foreign_user["user_id"] = 764
+        foreign_service = dict(PRODUCTION_WITHDRAW)
+        foreign_service["user_service_id"] = 11451
+        short = dict(PRODUCTION_WITHDRAW)
+        short["total"] = 149
+        for withdraw in (foreign_user, foreign_service, short):
+            world = self._production_world()
+            result = self._execute(world, withdraw=withdraw, us_id="11450", user_id="763")
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(_reason(result), "payment_mismatch")
+            self.assertEqual(_patches(world), [])
+
+    def test_03_flat_withdraw_list_is_not_parsed(self) -> None:
+        flat = [item for pair in PRODUCTION_WITHDRAW.items() for item in pair]
+        world = self._production_world()
+        result = self._execute(world, withdraw=flat, us_id="11450", user_id="763")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "withdraw_unreadable")
+        self.assertEqual(_patches(world), [])
+
+    def test_03_remove_accepts_the_pairs_withdraw(self) -> None:
+        period = "2026-11"
+        _, end = _period_bounds(period)
+        world = World(period)
+        world.parent = _parent(user_id=763)
+        world.user["trafficLimitBytes"] = TARGET
+        world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+        result = self._remove(
+            world,
+            _stamp_epoch(end) + 3600,
+            withdraw=PRODUCTION_WITHDRAW,
+            us_id="11450",
+            user_id="763",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "restored")
+        self.assertEqual(world.user["trafficLimitBytes"], BASE)
+        self.assertEqual(len(_patches(world)), 1)
 
     def test_03_unpaid_withdraw_does_not_grant(self) -> None:
         period = _open_period()

@@ -71,8 +71,11 @@ __SHM_JSON__{{ toJson(us.service.settings) }}
 __SHM_CATALOG_JSON__
 )"
 CATALOG_JSON="${CATALOG_JSON#__SHM_JSON__}"
+# pairs — скалярный get. Template Toolkit вызывает get списком, и toJson
+# превращает одну запись списания в плоский массив. CREATE и REMOVE читают
+# одно и то же выражение.
 WITHDRAW_JSON="$(cat <<'__SHM_WITHDRAW_JSON__'
-__SHM_JSON__{{ toJson(us.withdraw.get) }}
+__SHM_JSON__{{ toJson(us.withdraw.pairs) }}
 __SHM_WITHDRAW_JSON__
 )"
 WITHDRAW_JSON="${WITHDRAW_JSON#__SHM_JSON__}"
