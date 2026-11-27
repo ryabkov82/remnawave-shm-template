@@ -110,7 +110,8 @@ PANEL_FILE=""
 BASE_LIMIT=""
 ADDON_LIMIT=""
 APPLIED_LIMIT=""
-PATCH_UUID=""
+PANEL_ID=""
+PATCH_ID=""
 
 log() {
   echo "[$(date -u +'%F %T')] purchase_id=${PURCHASE_ID:-} parent_user_service_id=${PARENT_US_ID:-} addon_user_service_id=${ADDON_US_ID:-} period=${PERIOD:-} stage=${STAGE} $*" >&2
@@ -332,12 +333,12 @@ _load_panel_fields() {
   PANEL_USERNAME="$(jq -r '.response.username // empty' "${panel}")"
   PANEL_STATUS="$(jq -r '.response.status // empty' "${panel}")"
   PANEL_STRATEGY="$(jq -r '.response.trafficLimitStrategy // empty' "${panel}")"
-  PANEL_UUID="$(jq -r '.response.uuid // empty' "${panel}")"
+  PANEL_ID="$(jq -r '.response.id // empty' "${panel}")"
   PANEL_EXPIRE="$(jq -r '.response.expireAt // empty' "${panel}")"
   PANEL_LIMIT="$(jq -r '.response.trafficLimitBytes | tonumber? // empty' "${panel}")"
   [[ "${PANEL_USERNAME}" == "us_${PARENT_US_ID}" ]] || stop_permanent "panel_username_mismatch"
   [[ "${PANEL_STRATEGY}" == "MONTH" ]] || stop_permanent "strategy_mismatch"
-  [[ "${PANEL_UUID}" =~ ^[0-9a-fA-F-]{36}$ ]] || stop_temporary "panel_malformed"
+  [[ "${PANEL_ID}" =~ ^[1-9][0-9]*$ ]] || stop_temporary "panel_malformed"
   [[ "${PANEL_LIMIT}" =~ ^[0-9]+$ ]] || stop_temporary "panel_malformed"
   case "${PANEL_STATUS}" in
     ACTIVE|LIMITED) ;;
@@ -350,16 +351,16 @@ _note_period_crossed() {
   stop_permanent "period_crossed"
 }
 
-# UUID фиксируется в теле PATCH. Подтверждающее чтение должно вернуть того же пользователя.
-_require_patched_uuid() {
-  [[ -z "${PATCH_UUID}" || "${PANEL_UUID}" == "${PATCH_UUID}" ]] || stop_permanent "panel_uuid_mismatch"
+# Числовой id фиксируется до PATCH. Повторное чтение должно вернуть того же пользователя.
+_require_patched_user() {
+  [[ -z "${PATCH_ID}" || "${PANEL_ID}" == "${PATCH_ID}" ]] || stop_permanent "panel_user_mismatch"
 }
 
 _confirm_and_finish() {
   local panel="$1" patched="$2"
   _load_panel_fields "${panel}"
   if [[ "${patched}" == "yes" ]]; then
-    _require_patched_uuid
+    _require_patched_user
   fi
   if [[ "$(_period_status "${panel}")" == "period_closed" ]]; then
     if [[ "${patched}" == "yes" && "${PANEL_LIMIT}" == "${APPLIED_LIMIT}" ]]; then
@@ -475,11 +476,11 @@ _parent_kind() {
 }
 
 _restore_base() {
-  local body dest code panel limit uuid
-  PATCH_UUID="${PANEL_UUID}"
+  local body dest code panel limit user_id username
+  PATCH_ID="${PANEL_ID}"
   body="$(_tmp)"
-  jq -n --arg uuid "${PATCH_UUID}" --argjson trafficLimitBytes "${BASE_LIMIT}" \
-    '{uuid:$uuid, trafficLimitBytes:$trafficLimitBytes}' >"${body}"
+  jq -n --arg username "us_${PARENT_US_ID}" --argjson trafficLimitBytes "${BASE_LIMIT}" \
+    '{username:$username, trafficLimitBytes:$trafficLimitBytes}' >"${body}"
   dest="$(_tmp)"
   code="$(_curl_code "${dest}" -X PATCH -H "$(_auth_header)" \
     -H "Content-Type: application/json" --data-binary @"${body}" \
@@ -489,8 +490,9 @@ _restore_base() {
     stop_temporary "panel_unavailable"
   fi
   limit="$(jq -r '.response.trafficLimitBytes | tonumber? // empty' "${panel}")"
-  uuid="$(jq -r '.response.uuid // empty' "${panel}")"
-  [[ "${uuid}" == "${PATCH_UUID}" ]] || stop_permanent "panel_uuid_mismatch"
+  user_id="$(jq -r '.response.id // empty' "${panel}")"
+  username="$(jq -r '.response.username // empty' "${panel}")"
+  [[ "${user_id}" == "${PATCH_ID}" && "${username}" == "us_${PARENT_US_ID}" ]] || stop_permanent "panel_user_mismatch"
   if [[ "${limit}" == "${BASE_LIMIT}" ]]; then
     log "base_limit_bytes=${BASE_LIMIT} restored"
     echo "RESULT level=ok reason=restored" >&2
@@ -552,10 +554,10 @@ _finish_remove() {
   fi
   [[ "${decision}" == "clear" ]] || stop_temporary "history_unreadable"
   PANEL_USERNAME="$(jq -r '.response.username // empty' "${panel}")"
-  PANEL_UUID="$(jq -r '.response.uuid // empty' "${panel}")"
+  PANEL_ID="$(jq -r '.response.id // empty' "${panel}")"
   PANEL_LIMIT="$(jq -r '.response.trafficLimitBytes | tonumber? // empty' "${panel}")"
   [[ "${PANEL_USERNAME}" == "us_${PARENT_US_ID}" ]] || stop_permanent "panel_username_mismatch"
-  [[ "${PANEL_UUID}" =~ ^[0-9a-fA-F-]{36}$ ]] || stop_temporary "panel_malformed"
+  [[ "${PANEL_ID}" =~ ^[1-9][0-9]*$ ]] || stop_temporary "panel_malformed"
   [[ "${PANEL_LIMIT}" =~ ^[0-9]+$ ]] || stop_temporary "panel_malformed"
   if [[ "${PANEL_LIMIT}" == "${BASE_LIMIT}" ]]; then
     echo "RESULT level=ok reason=already_base" >&2
@@ -681,17 +683,17 @@ if [[ "${PANEL_LIMIT}" != "${BASE_LIMIT}" ]]; then
 fi
 
 STAGE="patch"
-PATCH_UUID="${PANEL_UUID}"
+PATCH_ID="${PANEL_ID}"
 patch_body="$(_tmp)"
-jq -n --arg uuid "${PATCH_UUID}" --argjson trafficLimitBytes "${APPLIED_LIMIT}" \
-  '{uuid:$uuid, trafficLimitBytes:$trafficLimitBytes}' >"${patch_body}"
+jq -n --arg username "us_${PARENT_US_ID}" --argjson trafficLimitBytes "${APPLIED_LIMIT}" \
+  '{username:$username, trafficLimitBytes:$trafficLimitBytes}' >"${patch_body}"
 patch_dest="$(_tmp)"
 patch_code="$(_curl_code "${patch_dest}" -X PATCH -H "$(_auth_header)" \
   -H "Content-Type: application/json" --data-binary @"${patch_body}" \
   "${PANEL_URL}/api/users")"
 PANEL_FILE="$(_panel_file)"
 _load_panel_fields "${PANEL_FILE}"
-_require_patched_uuid
+_require_patched_user
 if [[ "$(_period_status "${PANEL_FILE}")" == "period_closed" && "${PANEL_LIMIT}" == "${APPLIED_LIMIT}" ]]; then
   _note_period_crossed
 fi

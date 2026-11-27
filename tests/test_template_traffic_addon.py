@@ -35,7 +35,8 @@ SIBLING = 18439
 ADDON = 99001
 USER = 1001
 PURCHASE = "0123456789abcdef0123456789abcdef"
-UUID = "11111111-1111-4111-8111-111111111111"
+PANEL_ID = 10
+VLESS_UUID = "11111111-1111-4111-8111-111111111111"
 EXPIRE = "2026-12-15T00:00:00.000Z"
 TOKEN = "test-token-must-not-appear"
 _UNSET = object()
@@ -191,16 +192,17 @@ def _user(
     created_at: Optional[str] = None,
 ) -> Dict[str, Any]:
     user: Dict[str, Any] = {
-        "uuid": UUID,
-        "id": 10,
+        "id": PANEL_ID,
         "username": f"us_{PARENT}",
         "status": status,
         "trafficLimitBytes": limit,
-        "usedTrafficBytes": 1024,
         "trafficLimitStrategy": "MONTH",
         "lastTrafficResetAt": reset_at,
         "expireAt": EXPIRE,
         "hwidDeviceLimit": 3,
+        "description": "kept",
+        "vlessUuid": VLESS_UUID,
+        "userTraffic": {"usedTrafficBytes": 1024, "lifetimeUsedTrafficBytes": 2048},
     }
     if created_at is not None:
         user["createdAt"] = created_at
@@ -211,7 +213,10 @@ class World:
     def __init__(self, period: str) -> None:
         self.lock = threading.Lock()
         self.period = period
-        self.user = _user(reset_at=_period_bounds(period)[0].replace("Z", ".000Z"))
+        self.user = _user(
+            reset_at=_period_bounds(period)[0].replace("Z", ".000Z"),
+            created_at="2026-10-02T00:32:25.000Z",
+        )
         primary = _parent()["data"][0]
         sibling = dict(primary)
         sibling["user_service_id"] = SIBLING
@@ -229,7 +234,8 @@ class World:
         self.clock_jump_to = 0
         self.clock_file = ""
         self.prolong_expire = ""
-        self.swap_uuid_on_get = 0
+        self.swap_id_on_get = 0
+        self.reply_username = ""
         self.panel_missing = False
 
     def record(self, method: str, path: str, body: Any, query: str = "") -> None:
@@ -304,21 +310,27 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"data": public})
                 return
             if re.fullmatch(r"/api/users/by-username/us_\d+", path):
+                absent = {"errorCode": "A063", "message": "User with specified params not found"}
                 if path != f"/api/users/by-username/{world.user.get('username', '')}":
-                    self._send(404, {"error": "not found"})
+                    self._send(404, absent)
                     return
                 world.panel_gets += 1
                 if world.panel_missing:
-                    self._send(404, {"error": "not found"})
+                    self._send(404, absent)
                     return
                 if world.jump_clock_on == "reread" and world.panel_gets == 2 and world.clock_file:
                     Path(world.clock_file).write_text(str(world.clock_jump_to))
                 if world.fail_panel_get_at and world.panel_gets == world.fail_panel_get_at:
                     self._send(503, {"error": "unavailable"})
                     return
-                if world.swap_uuid_on_get and world.panel_gets == world.swap_uuid_on_get:
+                if world.swap_id_on_get and world.panel_gets == world.swap_id_on_get:
                     changed = dict(world.user)
-                    changed["uuid"] = "22222222-2222-4222-8222-222222222222"
+                    changed["id"] = int(world.user["id"]) + 1
+                    self._send(200, {"response": changed})
+                    return
+                if world.reply_username:
+                    changed = dict(world.user)
+                    changed["username"] = world.reply_username
                     self._send(200, {"response": changed})
                     return
                 if world.panel_failures > 0:
@@ -330,7 +342,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/users" and method == "PATCH":
                 if world.jump_clock_on == "patch" and world.clock_file:
                     Path(world.clock_file).write_text(str(world.clock_jump_to))
-                if world.apply_patch and isinstance(body, dict) and "trafficLimitBytes" in body:
+                if (
+                    world.apply_patch
+                    and isinstance(body, dict)
+                    and body.get("username") == world.user.get("username")
+                    and "trafficLimitBytes" in body
+                ):
                     world.user["trafficLimitBytes"] = body["trafficLimitBytes"]
                     world.applied_patches += 1
                 if world.prolong_expire:
@@ -483,8 +500,10 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         blob = result.stdout + result.stderr
         self.assertNotIn(TOKEN, blob)
         for call in _patches(world):
-            self.assertEqual(set(call["body"]), {"uuid", "trafficLimitBytes"})
-            self.assertEqual(call["body"]["uuid"], UUID)
+            self.assertEqual(set(call["body"]), {"username", "trafficLimitBytes"})
+            self.assertEqual(call["body"]["username"], world.user["username"])
+            self.assertNotIn("uuid", call["body"])
+            self.assertNotIn("vlessUuid", call["body"])
 
     def _clock(self, world: World, jump_to: int) -> Dict[str, str]:
         handle = tempfile.NamedTemporaryFile("w", delete=False)
@@ -503,8 +522,13 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
         self.assertEqual(world.user["expireAt"], EXPIRE)
         self.assertEqual(world.user["trafficLimitStrategy"], "MONTH")
-        self.assertEqual(world.user["usedTrafficBytes"], 1024)
+        self.assertEqual(world.user["userTraffic"]["usedTrafficBytes"], 1024)
         self.assertEqual(world.user["status"], "ACTIVE")
+        self.assertEqual(world.user["id"], PANEL_ID)
+        self.assertEqual(world.user["hwidDeviceLimit"], 3)
+        self.assertEqual(world.user["description"], "kept")
+        self.assertEqual(world.user["vlessUuid"], VLESS_UUID)
+        self.assertNotIn("uuid", world.user)
         self.assertEqual(len(_patches(world)), 1)
         self.assertEqual(_patches(world)[0]["body"]["trafficLimitBytes"], TARGET)
         self.assertIn("filter=%7B%22user_service_id%22%3A18432%7D", _parent_filters(world))
@@ -703,7 +727,7 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(_reason(result), "applied")
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
-        self.assertEqual(world.user["usedTrafficBytes"], 1024)
+        self.assertEqual(world.user["userTraffic"]["usedTrafficBytes"], 1024)
         self.assertEqual(world.user["expireAt"], EXPIRE)
         self.assertIn("filter=%7B%22user_service_id%22%3A2699%7D", _parent_filters(world))
         self.assertEqual(len(_patches(world)), 1)
@@ -1018,7 +1042,7 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(world.user["trafficLimitBytes"], TARGET)
         self.assertEqual(world.user["expireAt"], prolonged)
-        self.assertEqual(set(_patches(world)[0]["body"]), {"uuid", "trafficLimitBytes"})
+        self.assertEqual(set(_patches(world)[0]["body"]), {"username", "trafficLimitBytes"})
         self.assert_clean(world, result)
 
     def test_temp_files_removed_on_success_and_error(self) -> None:
@@ -1064,16 +1088,36 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(_patches(world), [])
         self.assert_clean(world, result)
 
-    def test_confirm_uuid_must_match_patched_user(self) -> None:
+    def test_confirm_id_must_match_patched_user(self) -> None:
         period = _open_period()
         world = World(period)
-        world.swap_uuid_on_get = 3
+        world.swap_id_on_get = 3
         result = self._execute(world)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertEqual(_reason(result), "panel_uuid_mismatch")
+        self.assertEqual(_reason(result), "panel_user_mismatch")
         self.assertIn("level=permanent", result.stderr)
         self.assertEqual(len(_patches(world)), 1)
-        self.assertEqual(_patches(world)[0]["body"]["uuid"], UUID)
+        self.assertEqual(_patches(world)[0]["body"]["username"], f"us_{PARENT}")
+        self.assert_clean(world, result)
+
+    def test_response_without_internal_id_is_malformed(self) -> None:
+        period = _open_period()
+        world = World(period)
+        world.user.pop("id")
+        result = self._execute(world)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "panel_malformed")
+        self.assertEqual(_patches(world), [])
+        self.assert_clean(world, result)
+
+    def test_username_mismatch_is_rejected(self) -> None:
+        period = _open_period()
+        world = World(period)
+        world.reply_username = "us_other"
+        result = self._execute(world)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "panel_username_mismatch")
+        self.assertEqual(_patches(world), [])
         self.assert_clean(world, result)
 
     def test_parent_progress_during_activate_is_temporary(self) -> None:
