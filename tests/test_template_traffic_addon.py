@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -18,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest import TestCase
+from urllib.parse import parse_qs, urlsplit
 
 from tests.proxy_env import DisableEnvProxiesMixin
 
@@ -29,6 +31,7 @@ BASE = 322122547200
 PACK = 322122547200
 TARGET = BASE + PACK
 PARENT = 18432
+SIBLING = 18439
 ADDON = 99001
 USER = 1001
 PURCHASE = "0123456789abcdef0123456789abcdef"
@@ -209,7 +212,11 @@ class World:
         self.lock = threading.Lock()
         self.period = period
         self.user = _user(reset_at=_period_bounds(period)[0].replace("Z", ".000Z"))
-        self.parent = _parent()
+        primary = _parent()["data"][0]
+        sibling = dict(primary)
+        sibling["user_service_id"] = SIBLING
+        self.parent = {"data": [primary, sibling]}
+        self.reveal_user_id = False
         self.calls: List[Dict[str, Any]] = []
         self.panel_failures = 0
         self.panel_gets = 0
@@ -225,8 +232,8 @@ class World:
         self.swap_uuid_on_get = 0
         self.panel_missing = False
 
-    def record(self, method: str, path: str, body: Any) -> None:
-        self.calls.append({"method": method, "path": path, "body": body})
+    def record(self, method: str, path: str, body: Any, query: str = "") -> None:
+        self.calls.append({"method": method, "path": path, "body": body, "query": query})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -266,15 +273,40 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _dispatch(self, method: str) -> None:
-        path = self.path.split("?", 1)[0]
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        query = parsed.query
         body = self._body() if method in {"PUT", "POST", "PATCH"} else None
         world = self.world
         with world.lock:
-            world.record(method, path, body)
+            world.record(method, path, body, query)
             if path == "/shm/v1/user/service":
-                self._send(world.parent_status, world.parent if world.parent_status == 200 else {"error": "down"})
+                if world.parent_status != 200:
+                    self._send(world.parent_status, {"error": "down"})
+                    return
+                rows = world.parent.get("data") if isinstance(world.parent, dict) else None
+                rows = list(rows) if isinstance(rows, list) else []
+                params = parse_qs(query, keep_blank_values=True)
+                if "filter" in params:
+                    try:
+                        filt = json.loads(params["filter"][0])
+                    except json.JSONDecodeError:
+                        rows = []
+                    else:
+                        wanted = filt.get("user_service_id") if isinstance(filt, dict) else None
+                        rows = [row for row in rows if str(row.get("user_service_id")) == str(wanted)]
+                public = []
+                for row in rows:
+                    item = dict(row)
+                    if not world.reveal_user_id:
+                        item.pop("user_id", None)
+                    public.append(item)
+                self._send(200, {"data": public})
                 return
-            if path == f"/api/users/by-username/us_{PARENT}":
+            if re.fullmatch(r"/api/users/by-username/us_\d+", path):
+                if path != f"/api/users/by-username/{world.user.get('username', '')}":
+                    self._send(404, {"error": "not found"})
+                    return
                 world.panel_gets += 1
                 if world.panel_missing:
                     self._send(404, {"error": "not found"})
@@ -386,6 +418,10 @@ def _patches(world: World) -> List[Dict[str, Any]]:
     return [call for call in world.calls if call["method"] == "PATCH"]
 
 
+def _parent_filters(world: World) -> List[str]:
+    return [call["query"] for call in world.calls if call["path"] == "/shm/v1/user/service"]
+
+
 def _forbidden(world: World) -> List[str]:
     found = []
     for call in world.calls:
@@ -471,6 +507,7 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(world.user["status"], "ACTIVE")
         self.assertEqual(len(_patches(world)), 1)
         self.assertEqual(_patches(world)[0]["body"]["trafficLimitBytes"], TARGET)
+        self.assertIn("filter=%7B%22user_service_id%22%3A18432%7D", _parent_filters(world))
         self.assert_clean(world, result)
 
     def test_02_repeat_does_not_add_another_pack(self) -> None:
@@ -536,6 +573,53 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         self.assertEqual(_reason(result), "restored")
         self.assertEqual(world.user["trafficLimitBytes"], BASE)
         self.assertEqual(len(_patches(world)), 1)
+        self.assertIn("filter=%7B%22user_service_id%22%3A18432%7D", _parent_filters(world))
+
+    def test_03_remove_rejects_a_revealed_foreign_parent(self) -> None:
+        period = "2026-11"
+        _, end = _period_bounds(period)
+        world = World(period)
+        world.parent = _parent(user_id=USER + 9)
+        world.reveal_user_id = True
+        world.user["trafficLimitBytes"] = TARGET
+        world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+        result = self._remove(world, _stamp_epoch(end) + 3600)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "parent_not_owned")
+        self.assertEqual(_patches(world), [])
+        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
+
+    def test_03_remove_ignores_other_services_in_history(self) -> None:
+        period = "2026-11"
+        _, end = _period_bounds(period)
+        standard = {
+            "user_service_id": 7742,
+            "user_id": 763,
+            "service_id": 3,
+            "status": "ACTIVE",
+            "settings": {},
+        }
+        world = World(period)
+        world.user["trafficLimitBytes"] = TARGET
+        world.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+        result = self._remove(world, _stamp_epoch(end) + 3600, services=[standard], withdraws=[])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "restored")
+        self.assertEqual(world.user["trafficLimitBytes"], BASE)
+        newer, money = _grant("2026-12", "ACTIVE")
+        blocked = World(period)
+        blocked.user["trafficLimitBytes"] = TARGET
+        blocked.user["lastTrafficResetAt"] = end.replace("Z", ".000Z")
+        blocked_result = self._remove(
+            blocked,
+            _stamp_epoch(end) + 3600,
+            services=[standard, newer],
+            withdraws=[money],
+        )
+        self.assertEqual(blocked_result.returncode, 0, blocked_result.stdout + blocked_result.stderr)
+        self.assertEqual(_reason(blocked_result), "newer_pack")
+        self.assertEqual(_patches(blocked), [])
+        self.assertEqual(blocked.user["trafficLimitBytes"], TARGET)
 
     def test_03_unpaid_withdraw_does_not_grant(self) -> None:
         period = _open_period()
@@ -586,10 +670,56 @@ class TrafficAddonTests(DisableEnvProxiesMixin, TestCase):
         period = _open_period()
         world = World(period)
         world.parent = _parent(user_id=USER + 9)
+        world.reveal_user_id = True
         result = self._execute(world)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(_reason(result), "parent_not_owned")
         self.assertEqual(_patches(world), [])
+        self.assert_clean(world, result)
+
+    def test_07b_several_subscriptions_require_the_parent_filter(self) -> None:
+        period = _open_period()
+        world = World(period)
+        world.parent = {"data": [_parent()["data"][0], _parent(service_id=4)["data"][0]]}
+        world.parent["data"][1]["user_service_id"] = SIBLING
+        result = self._execute(world)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
+        self.assertIn("filter=%7B%22user_service_id%22%3A18432%7D", _parent_filters(world))
+        self.assert_clean(world, result)
+
+        missed = World(period)
+        missed.parent = {"data": [_parent()["data"][0]]}
+        missed.parent["data"][0]["user_service_id"] = SIBLING
+        missed_result = self._execute(missed)
+        self.assertEqual(missed_result.returncode, 1)
+        self.assertEqual(_reason(missed_result), "parent_not_owned")
+        self.assertEqual(_patches(missed), [])
+
+    def test_07c_hidden_user_id_still_grants_the_owned_parent(self) -> None:
+        world = World("2026-11")
+        owned = _parent(user_id=763)["data"][0]
+        owned["user_service_id"] = 2699
+        other = dict(owned)
+        other["user_service_id"] = 7742
+        world.parent = {"data": [other, owned]}
+        world.user["username"] = "us_2699"
+        settings = _settings("2026-11")
+        settings["parent_user_service_id"] = 2699
+        result = self._execute(
+            world,
+            settings=settings,
+            withdraw=PRODUCTION_WITHDRAW,
+            us_id="11450",
+            user_id="763",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(_reason(result), "applied")
+        self.assertEqual(world.user["trafficLimitBytes"], TARGET)
+        self.assertEqual(world.user["usedTrafficBytes"], 1024)
+        self.assertEqual(world.user["expireAt"], EXPIRE)
+        self.assertIn("filter=%7B%22user_service_id%22%3A2699%7D", _parent_filters(world))
+        self.assertEqual(len(_patches(world)), 1)
         self.assert_clean(world, result)
 
     def test_08_tariff_outside_allow_list(self) -> None:

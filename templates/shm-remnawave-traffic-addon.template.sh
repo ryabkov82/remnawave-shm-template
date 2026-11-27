@@ -191,11 +191,22 @@ _on_exit() {
 trap _on_exit EXIT
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/traffic-addon.XXXXXX")"
 
+# SHM 3.7.0 применяет user_service_id только из filter. Пользовательский
+# ответ не содержит user_id: список уже ограничен сессией. Чужой
+# идентификатор, если он всё же есть в ответе, по-прежнему отклоняется.
+_parent_service_url() {
+  local encoded
+  encoded="$(jq -rn --arg id "${PARENT_US_ID}" '{user_service_id: ($id | tonumber)} | @uri')" \
+    || stop_temporary "parent_filter"
+  [[ -n "${encoded}" ]] || stop_temporary "parent_filter"
+  printf '%s/shm/v1/user/service?filter=%s' "${API_URL}" "${encoded}"
+}
+
 _require_parent() {
   local dest code reason
   dest="$(_tmp)" || stop_temporary "shm_io"
   code="$(_curl_code "${dest}" -H "session-id: ${SESSION_ID}" \
-    "${API_URL}/shm/v1/user/service?user_service_id=${PARENT_US_ID}")"
+    "$(_parent_service_url)")"
   if [[ "${code}" == "transport" || "${code}" =~ ^5 ]]; then
     stop_temporary "shm_unavailable"
   fi
@@ -205,7 +216,7 @@ _require_parent() {
   reason="$(jq -r --arg parent_id "${PARENT_US_ID}" --arg user "${ADDON_USER_ID}" --slurpfile cat <(printf '%s' "${CATALOG_JSON}") '
     if (.data | type != "array") or (.data | length != 1) then "parent_not_owned"
     elif (.data[0].user_service_id | tostring) != $parent_id then "parent_not_owned"
-    elif (.data[0].user_id | tostring) != $user then "parent_not_owned"
+    elif ((.data[0] | has("user_id")) and ((.data[0].user_id | tostring) != $user)) then "parent_not_owned"
     elif .data[0].status == "PROGRESS" then "parent_in_progress"
     elif .data[0].status != "ACTIVE" then "parent_not_active"
     elif .data[0].service.category != $cat[0].traffic_addon.parent_category then "parent_category_mismatch"
@@ -425,6 +436,8 @@ _other_live_pack() {
     | reduce $list[] as $row ("clear";
         if . == "block" then .
         elif ($row.user_service_id | tostring) == $self then .
+        elif ($row.service_id == null) then error("unreadable")
+        elif ($row.service_id | tostring) != "17" then .
         elif ($row.settings | type) != "object"
           or ($row.settings.period_ends_at | type) != "string"
           or (($row.settings.expected_amount | cents) <= 0)
@@ -452,8 +465,8 @@ _parent_kind() {
     if (.data | type) != "array" then "unreadable"
     elif (.data | length) == 0 then "deleted"
     elif (.data | length) != 1 then "unreadable"
-    elif ((.data[0].user_service_id | tostring) != $parent_id)
-      or ((.data[0].user_id | tostring) != $user) then "foreign"
+    elif (.data[0].user_service_id | tostring) != $parent_id then "foreign"
+    elif ((.data[0] | has("user_id")) and ((.data[0].user_id | tostring) != $user)) then "foreign"
     elif ((.data[0].status // "") | ascii_upcase) == "REMOVED" then "removed"
     else "owned" end
   ' "${file}"
@@ -496,7 +509,7 @@ _finish_remove() {
   fi
   parent_file="$(_tmp)" || stop_temporary "shm_io"
   parent_code="$(_curl_code "${parent_file}" -H "session-id: ${SESSION_ID}" \
-    "${API_URL}/shm/v1/user/service?user_service_id=${PARENT_US_ID}")"
+    "$(_parent_service_url)")"
   if [[ "${parent_code}" == "transport" || "${parent_code}" =~ ^5 ]]; then
     stop_temporary "shm_unavailable"
   fi
