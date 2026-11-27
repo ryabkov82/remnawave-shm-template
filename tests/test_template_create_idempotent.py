@@ -24,6 +24,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -114,6 +115,8 @@ class State:
         self.subscription_username = None
         self.subscription_short = None
         self.shm_status = 200
+        self.shm_error = "storage rejected"
+        self.shm_put_mode = ""
 
     def reset(self) -> None:
         with self.lock:
@@ -129,6 +132,8 @@ class State:
             self.subscription_username = None
             self.subscription_short = None
             self.shm_status = 200
+            self.shm_error = "storage rejected"
+            self.shm_put_mode = ""
 
     def seed(self, user: Dict[str, Any]) -> Dict[str, Any]:
         with self.lock:
@@ -396,6 +401,14 @@ class Handler(BaseHTTPRequestHandler):
             status, body = self._subscription()
             self._reply(status, body)
             return
+        if parsed.path == STORAGE_PATH:
+            with STATE.lock:
+                stored = copy.deepcopy(STATE.storage.get(parsed.path))
+            if stored is None:
+                self._reply(404, _dumps({"error": "Object not found. Check the ID."}))
+                return
+            self._reply(200, _dumps(stored))
+            return
         self._reply(500, _dumps({"message": "unexpected get", "path": parsed.path}))
 
     def do_POST(self) -> None:  # noqa: N802
@@ -412,6 +425,19 @@ class Handler(BaseHTTPRequestHandler):
                 STATE.payloads.append(payload)
             drop = STATE.post_mode in {"drop", "create_then_drop"}
             create_then_drop = STATE.post_mode == "create_then_drop"
+        if parsed.path == STORAGE_PATH:
+            with STATE.lock:
+                exists = parsed.path in STATE.storage
+            if not exists:
+                self._reply(404, _dumps({"error": "Object not found. Check the ID."}))
+                return
+            if not isinstance(payload, dict):
+                self._reply(400, _dumps({"error": "validation failed"}))
+                return
+            with STATE.lock:
+                STATE.storage[parsed.path] = payload
+            self._reply(200, _dumps({"result": "successful"}))
+            return
         if parsed.path != CREATE_PATH:
             self._reply(500, _dumps({"message": "unexpected post"}))
             return
@@ -435,15 +461,49 @@ class Handler(BaseHTTPRequestHandler):
         with STATE.lock:
             STATE.note("PUT", parsed.path)
             shm_status = STATE.shm_status
+            shm_error = STATE.shm_error
+            put_mode = STATE.shm_put_mode
+            exists = parsed.path in STATE.storage
         if parsed.path != STORAGE_PATH:
             self._reply(500, _dumps({"message": "unexpected put"}))
             return
         if shm_status != 200:
-            self._reply(shm_status, _dumps({"message": "storage rejected"}))
+            self._reply(shm_status, _dumps({"error": shm_error}))
+            return
+        if exists:
+            self._reply(
+                400,
+                _dumps(
+                    {
+                        "status": 400,
+                        "error": "Can't add a new object. Perhaps it already exists?",
+                    }
+                ),
+            )
+            return
+        if put_mode == "hang_after_store":
+            with STATE.lock:
+                STATE.storage[parsed.path] = json.loads(raw.decode())
+            time.sleep(3)
+            try:
+                self._reply(200, _dumps({"result": "successful"}))
+            except (BrokenPipeError, ConnectionError, OSError):
+                return
             return
         with STATE.lock:
             STATE.storage[parsed.path] = json.loads(raw.decode())
-        self._reply(200, _dumps({"ok": True}))
+        if put_mode == "store_then_exists":
+            self._reply(
+                400,
+                _dumps(
+                    {
+                        "status": 400,
+                        "error": "Can't add a new object. Perhaps it already exists?",
+                    }
+                ),
+            )
+            return
+        self._reply(200, _dumps({"result": "successful"}))
 
     def do_PATCH(self) -> None:  # noqa: N802
         self._read_body()
@@ -479,6 +539,16 @@ def _render(event: str, panel_url: str, api_url: str) -> str:
         "{{ us.id }}": US_ID,
         "{{ server.settings.remnawave.sanitize_username }}": "false",
         "{{ us.expire }}": "2026-12-31 23:59:59",
+        "{{ us.service.category }}": "",
+        "{{ us.service_id }}": "",
+        "{{ us.user_id }}": "",
+        "# {{ IF event_name == 'ACTIVATE' OR event_name == 'PROLONGATE' }}": "",
+        "# {{ IF us.service.category == 'vpn-mz-test' }}": "",
+        "# {{ IF us.service.settings.remnawave.traffic_limit_strategy.upper == 'MONTH' }}": "",
+        "# {{ IF us.service_id == 3 OR us.service_id == 4 OR us.service_id == 5 OR us.service_id == 6 }}": "",
+        "# {{ END }}": "",
+        "{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}": "[]",
+        "{{ toJson(user.wd.list(where = { service_id = 17 })) }}": "[]",
         "{{ toJson(user.login) }}": json.dumps("alice"),
         "{{ toJson(user.full_name) }}": json.dumps("Alice Example"),
         "{{ toJson(user.settings.telegram.login) }}": json.dumps("alice_tg"),
@@ -867,7 +937,8 @@ class CreateIdempotencyTests(DisableEnvProxiesMixin, unittest.TestCase):
         STATE.shm_status = 500
         failed = self._run()
         self.assertNotEqual(failed["code"], 0)
-        self.assertIn("curl exit 22", failed["stderr"])
+        self.assertIn("HTTP 500", failed["stderr"])
+        self.assertIn("storage rejected", failed["stderr"])
         self.assertEqual(failed["storage"], {})
         self.assertIn(("PUT", STORAGE_PATH), failed["calls"])
         self.assertEqual(self._posts(failed), [])
@@ -1047,6 +1118,98 @@ class CreateIdempotencyTests(DisableEnvProxiesMixin, unittest.TestCase):
             self.assertNotIn("_post_new_user", branch)
             self.assertNotIn("_save_create_subscription", branch)
             self.assertNotIn("_adopt_after_username_conflict", branch)
+
+    def test_first_create_puts_storage_only_when_the_key_is_absent(self) -> None:
+        result = self._run()
+        self.assertEqual(result["code"], 0, result["stderr"])
+        storage_calls = [call for call in result["calls"] if call[1] == STORAGE_PATH]
+        self.assertEqual(
+            storage_calls,
+            [("GET", STORAGE_PATH), ("PUT", STORAGE_PATH), ("GET", STORAGE_PATH)],
+        )
+        self.assertEqual(self._posts(result), [("POST", CREATE_PATH)])
+        self.assertEqual(result["storage"][STORAGE_PATH], _expected_subscription(result["users"][USERNAME]))
+
+    def test_repeat_create_after_storage_write_does_not_write_again(self) -> None:
+        first = self._run()
+        self.assertEqual(first["code"], 0, first["stderr"])
+        stored = copy.deepcopy(first["storage"])
+        created = copy.deepcopy(first["users"])
+        STATE.calls.clear()
+        STATE.payloads.clear()
+
+        second = self._run()
+        self.assertEqual(second["code"], 0, second["stderr"])
+        self.assertEqual(self._posts(second), [])
+        self.assertNotIn(("PUT", STORAGE_PATH), second["calls"])
+        self.assertNotIn(("POST", STORAGE_PATH), second["calls"])
+        self.assertIn(("GET", STORAGE_PATH), second["calls"])
+        self.assertEqual(second["users"], created)
+        self.assertEqual(second["storage"], stored)
+
+    def test_put_already_exists_is_success_when_the_reread_matches(self) -> None:
+        STATE.shm_put_mode = "store_then_exists"
+        result = self._run()
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(self._posts(result), [("POST", CREATE_PATH)])
+        self.assertIn(("PUT", STORAGE_PATH), result["calls"])
+        self.assertEqual(
+            result["storage"][STORAGE_PATH]["user"]["shortUuid"],
+            "fresh-short",
+        )
+        STATE.shm_put_mode = ""
+        STATE.calls.clear()
+        STATE.payloads.clear()
+
+        retry = self._run()
+        self.assertEqual(retry["code"], 0, retry["stderr"])
+        self.assertEqual(self._posts(retry), [])
+        self.assertNotIn(("PUT", STORAGE_PATH), retry["calls"])
+        self.assertEqual(retry["users"][USERNAME]["uuid"], FRESH_UUID)
+
+    def test_storage_timeout_after_write_then_retry_keeps_the_same_user(self) -> None:
+        STATE.shm_put_mode = "hang_after_store"
+        timed = self._run(extra_env={"REMNAWAVE_STORAGE_MAX_TIME": "1"})
+        self.assertEqual(timed["code"], 0, timed["stderr"])
+        self.assertEqual(self._posts(timed), [("POST", CREATE_PATH)])
+        self.assertEqual(timed["users"][USERNAME]["uuid"], FRESH_UUID)
+        self.assertIn(STORAGE_PATH, timed["storage"])
+        created = copy.deepcopy(timed["users"])
+        STATE.shm_put_mode = ""
+        STATE.calls.clear()
+        STATE.payloads.clear()
+
+        retry = self._run()
+        self.assertEqual(retry["code"], 0, retry["stderr"])
+        self.assertEqual(self._posts(retry), [])
+        self.assertNotIn(("PUT", STORAGE_PATH), retry["calls"])
+        self.assertEqual(retry["users"], created)
+
+    def test_other_storage_http_400_stays_visible(self) -> None:
+        before = STATE.seed(_stable_user())
+        STATE.shm_status = 400
+        STATE.shm_error = "Name is required"
+        failed = self._run()
+        self.assertNotEqual(failed["code"], 0)
+        self.assertIn("HTTP 400", failed["stderr"])
+        self.assertIn("Name is required", failed["stderr"])
+        self.assertNotIn("done", failed["stdout"])
+        self.assertEqual(failed["storage"], {})
+        self.assertEqual(self._posts(failed), [])
+        self.assertEqual(failed["users"][USERNAME], before)
+        self.assertIn(("PUT", STORAGE_PATH), failed["calls"])
+
+    def test_stale_storage_is_replaced_by_post(self) -> None:
+        before = STATE.seed(_stable_user())
+        STATE.storage[STORAGE_PATH] = {"user": {"username": USERNAME}, "stale": True}
+        result = self._run()
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(self._posts(result), [])
+        self.assertNotIn(("PUT", STORAGE_PATH), result["calls"])
+        self.assertIn(("POST", STORAGE_PATH), result["calls"])
+        self.assertEqual(result["users"][USERNAME], before)
+        self.assertEqual(result["storage"][STORAGE_PATH], _expected_subscription(before))
+        self.assertNotIn("stale", result["storage"][STORAGE_PATH])
 
 
 if __name__ == "__main__":

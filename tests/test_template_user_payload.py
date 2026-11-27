@@ -71,6 +71,16 @@ def _render(
         "{{ us.id }}": "42",
         "{{ server.settings.remnawave.sanitize_username }}": "false",
         "{{ us.expire }}": expire,
+        "{{ us.service.category }}": "",
+        "{{ us.service_id }}": "",
+        "{{ us.user_id }}": "",
+        "# {{ IF event_name == 'ACTIVATE' OR event_name == 'PROLONGATE' }}": "",
+        "# {{ IF us.service.category == 'vpn-mz-test' }}": "",
+        "# {{ IF us.service.settings.remnawave.traffic_limit_strategy.upper == 'MONTH' }}": "",
+        "# {{ IF us.service_id == 3 OR us.service_id == 4 OR us.service_id == 5 OR us.service_id == 6 }}": "",
+        "# {{ END }}": "",
+        "{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}": "[]",
+        "{{ toJson(user.wd.list(where = { service_id = 17 })) }}": "[]",
     }
     # SHM replaces {{ toJson(user.*) }} with a JSON string. The unfixed template
     # still interpolates the raw {{ user.* }} value into shell source.

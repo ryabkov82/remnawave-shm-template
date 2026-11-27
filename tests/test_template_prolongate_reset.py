@@ -130,6 +130,31 @@ curl() {
     fi
     printf '%s' '{"response":{"id":77}}' > "${outfile}"
   fi
+  if [[ "${url}" == *"/shm/v1/storage/manage/"* ]]; then
+    local store="${STORAGE_FILE:-}"
+    if [[ "${method}" == "PUT" || "${method}" == "POST" ]]; then
+      if [[ -n "${store}" && "${data}" == @* ]]; then
+        cp "${data#@}" "${store}"
+      fi
+      if [[ -n "${outfile}" && "${outfile}" != "/dev/null" ]]; then
+        printf '%s' '{"result":"successful"}' > "${outfile}"
+      fi
+      printf '%s' '200'
+      return 0
+    fi
+    if [[ -n "${store}" && -s "${store}" ]]; then
+      if [[ -n "${outfile}" && "${outfile}" != "/dev/null" ]]; then
+        cp "${store}" "${outfile}"
+      fi
+      printf '%s' '200'
+      return 0
+    fi
+    if [[ -n "${outfile}" && "${outfile}" != "/dev/null" ]]; then
+      printf '%s' '{"error":"Object not found. Check the ID."}' > "${outfile}"
+    fi
+    printf '%s' '404'
+    return 0
+  fi
   printf '%s' '200'
 }
 """
@@ -162,6 +187,16 @@ def _render_full(
         "{{ us.id }}": "42",
         "{{ server.settings.remnawave.sanitize_username }}": "false",
         "{{ us.expire }}": expire,
+        "{{ us.service.category }}": "",
+        "{{ us.service_id }}": "",
+        "{{ us.user_id }}": "",
+        "# {{ IF event_name == 'ACTIVATE' OR event_name == 'PROLONGATE' }}": "",
+        "# {{ IF us.service.category == 'vpn-mz-test' }}": "",
+        "# {{ IF us.service.settings.remnawave.traffic_limit_strategy.upper == 'MONTH' }}": "",
+        "# {{ IF us.service_id == 3 OR us.service_id == 4 OR us.service_id == 5 OR us.service_id == 6 }}": "",
+        "# {{ END }}": "",
+        "{{ toJson(user.services.list(where = { service_id = 17, status = 'ANY' })) }}": "[]",
+        "{{ toJson(user.wd.list(where = { service_id = 17 })) }}": "[]",
         "{{ toJson(user.login) }}": json.dumps("alice"),
         "{{ toJson(user.full_name) }}": json.dumps("Alice Example"),
         "{{ toJson(user.settings.telegram.login) }}": json.dumps("alice_tg"),
@@ -203,6 +238,7 @@ def _run_event(
         env["CALL_LOG"] = call_log
         env["RESET_LOG"] = reset_log
         env["PATCH_BODY"] = patch_body
+        env["STORAGE_FILE"] = os.path.join(tmp, "storage.json")
         proc = subprocess.run(
             ["bash", script],
             check=False,

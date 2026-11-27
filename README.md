@@ -738,6 +738,8 @@ sanitize_username: true
 
 Это закрывает обрыв между созданием пользователя и `PUT` в хранилище. SHM повторяет задачу в `FAIL` без лимита попыток ([spool](https://github.com/danuk/shm/blob/master/app/lib/Core/Spool.pm)); без идемпотентного `CREATE` каждая попытка снова упирается в `A019`. Таймаут SSH, который сейчас в production может завершиться как успешный (`SHM` [#136](https://github.com/danuk/shm/issues/136), исправление в [#137](https://github.com/danuk/shm/pull/137) ещё не развёрнуто), этот шаблон задним числом не переоткрывает.
 
+Отдельный шаблон `templates/shm-remnawave-traffic-addon.template.sh` обрабатывает только `CREATE` дополнительной услуги и не создаёт пользователя панели. Поведение таблицы выше он не меняет. Контракт, проверки и порядок будущего подключения описаны в [docs/traffic-addon.md](docs/traffic-addon.md).
+
 ---
 
 ## 🔗 Связанные проекты
